@@ -1,0 +1,745 @@
+'use client'
+// pages/index.tsx
+import Head from 'next/head';
+import { useState } from 'react';
+import Logo from '../components/Logo'
+
+// Define types for policy selections
+interface PolicySelections {
+  single_key: boolean;
+  multisig: {
+    selected: boolean;
+    m: number;
+    n: number;
+  };
+  timelock: {
+    selected: boolean;
+    type: 'absolute' | 'relative';
+    value: string; // Can be block height or timestamp
+  };
+  hashlock: {
+    selected: boolean;
+    algorithm: 'sha256' | 'hash256' | 'ripemd160' | 'hash160';
+    hash: string; // Hex string
+  };
+  vault: {
+    selected: boolean;
+    delay: string; // Blocks or Timestamp
+    destKey: string; // xpub or pubkey
+    cancelKey: string; // xpub or pubkey
+  };
+}
+
+// Define type for key inputs
+interface KeyInput {
+    id: number;
+    value: string; // xpub or pubkey
+}
+
+// Define type for combination type
+type CombinationType = 'and' | 'or' | 'threshold' | 'custom';
+
+export default function MiniscriptGenerator() {
+  // State for policy selections
+  const [policySelections, setPolicySelections] = useState<PolicySelections>({
+    single_key: false,
+    multisig: { selected: false, m: 1, n: 1 },
+    timelock: { selected: false, type: 'absolute', value: '' },
+    hashlock: { selected: false, algorithm: 'sha256', hash: '' },
+    vault: { selected: false, delay: '', destKey: '', cancelKey: '' },
+  });
+
+  // State for key inputs
+  const [keyInputs, setKeyInputs] = useState<KeyInput[]>([{ id: 1, value: '' }]);
+  const [nextKeyId, setNextKeyId] = useState(2); // Counter for unique key input IDs
+
+  // State for policy combination
+  const [combinationType, setCombinationType] = useState<CombinationType>('and');
+  const [thresholdK, setThresholdK] = useState(1);
+  const [customPolicyString, setCustomPolicyString] = useState('');
+
+  // State for descriptor type
+  const [descriptorType, setDescriptorType] = useState<'wsh' | 'sh_wsh' | 'tr'>('wsh');
+
+  // State for output
+  const [generatedDescriptor, setGeneratedDescriptor] = useState('');
+  const [exampleAddress, setExampleAddress] = useState(''); // Placeholder for derived address
+  const [spendingConditionsSummary, setSpendingConditionsSummary] = useState('');
+  const [showOutput, setShowOutput] = useState(false);
+  const [error, setError] = useState('');
+
+  // Handle checkbox changes for policy types
+  const handlePolicyChange = (policy: keyof PolicySelections, isSelected: boolean) => {
+    setPolicySelections(prevState => ({
+      ...prevState,
+      [policy]: typeof prevState[policy] === 'boolean'
+        ? isSelected // For single boolean policies like single_key
+        : { ...prevState[policy], selected: isSelected }, // For policies with nested parameters
+    }));
+    setError(''); // Clear error on policy change
+  };
+
+  // Handle input changes for nested policy parameters (multisig, timelock, hashlock, vault)
+  const handlePolicyParameterChange = (policy: keyof PolicySelections, param: string, value: any) => {
+      setPolicySelections(prevState => ({
+        ...prevState,
+        [policy]: {
+            ...(prevState[policy] as any), // Cast to any to access nested properties
+            [param]: value,
+        },
+      }));
+      setError(''); // Clear error on parameter change
+  };
+
+
+  // Handle key input changes
+  const handleKeyInputChange = (id: number, value: string) => {
+    setKeyInputs(keyInputs.map(keyInput =>
+      keyInput.id === id ? { ...keyInput, value } : keyInput
+    ));
+    setError(''); // Clear error on key change
+  };
+
+  // Add a new key input field
+  const addKeyInput = () => {
+    setKeyInputs([...keyInputs, { id: nextKeyId, value: '' }]);
+    setNextKeyId(nextKeyId + 1);
+    setError(''); // Clear error on adding key
+  };
+
+  // Handle combination type change
+  const handleCombinationTypeChange = (type: CombinationType) => {
+    setCombinationType(type);
+    setError(''); // Clear error on combination type change
+  };
+
+  // Handle descriptor type change
+  const handleDescriptorTypeChange = (type: 'wsh' | 'sh_wsh' | 'tr') => {
+    setDescriptorType(type);
+    setError(''); // Clear error on descriptor type change
+  };
+
+  // Basic validation for inputs
+  const validateInputs = (): string | null => {
+      const keys = keyInputs.map(k => k.value).filter(v => v);
+
+      if (policySelections.multisig.selected) {
+          if (policySelections.multisig.m <= 0 || policySelections.multisig.n <= 0 || policySelections.multisig.m > policySelections.multisig.n) {
+              return "Multisig M and N values are invalid.";
+          }
+          if (keys.length < policySelections.multisig.n) {
+              return `Not enough keys provided for ${policySelections.multisig.n}-of-${policySelections.multisig.n} multisig.`;
+          }
+      }
+
+      if (policySelections.timelock.selected && !policySelections.timelock.value) {
+          return "Timelock value is required.";
+      }
+      if (policySelections.timelock.selected && isNaN(parseInt(policySelections.timelock.value))) {
+           return "Timelock value must be a number.";
+      }
+
+      if (policySelections.hashlock.selected && !policySelections.hashlock.hash) {
+          return "Hash value is required for hashlock.";
+      }
+       if (policySelections.hashlock.selected && !/^[0-9a-fA-F]+$/.test(policySelections.hashlock.hash)) {
+           return "Hash value must be a hexadecimal string.";
+       }
+       if (policySelections.hashlock.selected && policySelections.hashlock.algorithm.includes('sha256') && policySelections.hashlock.hash.length !== 64) {
+            return "SHA256/HASH256 hash must be 64 hex characters.";
+       }
+        if (policySelections.hashlock.selected && policySelections.hashlock.algorithm.includes('ripemd160') && policySelections.hashlock.hash.length !== 40) {
+            return "RIPEMD160/HASH160 hash must be 40 hex characters.";
+       }
+
+
+      if (policySelections.vault.selected) {
+          if (!policySelections.vault.delay || !policySelections.vault.destKey || !policySelections.vault.cancelKey) {
+              return "Vault requires delay, destination key, and cancel key.";
+          }
+           if (isNaN(parseInt(policySelections.vault.delay))) {
+                return "Vault delay must be a number.";
+           }
+      }
+
+      if (combinationType === 'threshold' && (thresholdK <= 0 || thresholdK > Object.values(policySelections).filter((p: any) => p.selected || p === true).length)) {
+           return "Threshold K value is invalid for the selected policies.";
+      }
+
+       if (combinationType === 'custom' && !customPolicyString) {
+           return "Custom policy string is required when selecting 'Custom Policy String'.";
+       }
+
+
+      // Add more specific key format validation if needed (e.g., xpub vs pubkey)
+
+      return null; // No errors
+  }
+
+
+  // Function to construct the Miniscript policy string
+  const constructPolicyString = (): string => {
+    const policies: string[] = [];
+    const keys = keyInputs.map(k => k.value).filter(v => v); // Get non-empty key values
+
+    // Construct individual policy strings based on selections
+    if (policySelections.single_key && keys.length > 0) {
+      // Use the first provided key for the single key policy
+      policies.push(`pk(${keys[0]})`);
+    }
+
+    if (policySelections.multisig.selected && keys.length >= policySelections.multisig.n) {
+        // Construct multi-sig policy string using the first N keys
+        const multisigKeys = keys.slice(0, policySelections.multisig.n).map(key => key);
+        // Note: In Miniscript policy, multi is used, but it compiles to different Miniscript fragments
+        policies.push(`multi(${policySelections.multisig.m},${multisigKeys.join(',')})`);
+    }
+
+    if (policySelections.timelock.selected && policySelections.timelock.value) {
+      const timelockFn = policySelections.timelock.type === 'absolute' ? 'after' : 'older';
+      policies.push(`${timelockFn}(${policySelections.timelock.value})`);
+    }
+
+    if (policySelections.hashlock.selected && policySelections.hashlock.hash) {
+      policies.push(`${policySelections.hashlock.algorithm}(${policySelections.hashlock.hash})`);
+    }
+
+     if (policySelections.vault.selected && policySelections.vault.delay && policySelections.vault.destKey && policySelections.vault.cancelKey) {
+        // Vault policy example: or(and(pk(DEST), after(DELAY)), pk(CANCEL))
+        // This is a simplified representation. A real vault often involves a two-stage process
+        // and might be better represented directly in the custom policy string for clarity.
+        // For this generator, we'll construct this common pattern.
+        policies.push(`or(and(pk(${policySelections.vault.destKey}),after(${policySelections.vault.delay})),pk(${policySelections.vault.cancelKey}))`);
+    }
+
+
+    // Combine selected policies based on combinationType
+    if (combinationType === 'custom') {
+        return customPolicyString; // Use the custom string directly
+    }
+
+    if (policies.length === 0) {
+      return ''; // No policies selected
+    } else if (policies.length === 1) {
+      return policies[0]; // Only one policy, no combination needed
+    } else {
+      switch (combinationType) {
+        case 'and':
+          // Combine multiple policies with 'and'
+          return `and(${policies.join(',')})`;
+        case 'or':
+           // Combine multiple policies with 'or'
+          return `or(${policies.join(',')})`;
+        case 'threshold':
+             if (thresholdK > 0 && thresholdK <= policies.length) {
+                 return `thresh(${thresholdK},${policies.join(',')})`;
+             } else {
+                 return 'Error: Invalid threshold K for selected policies';
+             }
+        default:
+          return ''; // Should not happen with radio buttons
+      }
+    }
+  };
+
+  // Handle the "Generate Descriptor" button click
+  const handleGenerateDescriptor = () => {
+    const validationError = validateInputs();
+    if (validationError) {
+        setError(validationError);
+        setShowOutput(false);
+        return;
+    }
+    setError(''); // Clear previous errors
+
+    const policyString = constructPolicyString();
+
+    if (!policyString || policyString.startsWith('Error')) {
+        setGeneratedDescriptor(policyString || 'Error: Could not construct policy string.');
+        setExampleAddress('');
+        setSpendingConditionsSummary('Please check your policy selections and inputs.');
+    } else {
+        // --- Backend Call Simulation ---
+        // In a real service, you would send policyString and descriptorType to your backend.
+        // The backend would use a Miniscript library (like rust-miniscript) to:
+        // 1. Compile the policy string into a Miniscript expression.
+        // 2. Compile the Miniscript expression into a Bitcoin Script.
+        // 3. Wrap the script in the chosen descriptor type (wsh, sh(wsh), tr).
+        // 4. Generate an example address from the descriptor.
+        // 5. Potentially provide a more detailed spending conditions summary.
+
+        // Placeholder for backend call result:
+        const finalDescriptor = `${descriptorType}(${policyString})`;
+        const derivedAddress = `bc1q...${Math.random().toString(36).substring(7)}...`; // Simulate address generation
+        const summary = `This descriptor describes an output locked by the policy: "${policyString}".\n\nTo spend funds sent to addresses derived from this descriptor, you will need to satisfy the conditions defined by this policy. The specific requirements (signatures, preimages, timelocks) depend on the policy structure.`;
+
+        setGeneratedDescriptor(finalDescriptor);
+        setExampleAddress(derivedAddress);
+        setSpendingConditionsSummary(summary);
+        // --- End Backend Call Simulation ---
+    }
+
+    setShowOutput(true);
+    // Scroll to the output section (optional, but good for UX)
+    document.getElementById('output-section')?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+
+  return (
+    <div className="bg-gray-100 p-6 min-h-screen">
+      <Head>
+      <Logo
+        imageUrl="/logo.png"
+        altText="My Awesome Logo"
+        linkUrl="/"
+        width={120}
+        height={40}
+        className="logo-container"
+        imageClassName="logo-image"
+      />
+        <title>Bitcoin Miniscript Policy Generator</title>
+        <meta name="description" content="Generate Bitcoin wallet descriptors for Miniscript policies" />
+        <link rel="icon" href="/favicon.ico" />
+      </Head>
+
+      <div className="max-w-4xl mx-auto bg-white p-8 rounded-lg shadow-md">
+
+        <h1 className="text-2xl font-bold mb-6 text-gray-800">Bitcoin Miniscript Policy Generator</h1>
+
+        <p className="mb-6 text-gray-600">Select and configure the conditions for your Bitcoin spending policy. This will be used to generate a wallet descriptor.</p>
+
+        {/* Policy Selection Section */}
+        <div className="mb-8 border-b pb-6">
+          <h2 className="text-xl font-semibold mb-4 text-gray-700">1. Choose Policy Type(s)</h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+
+            {/* Single Key */}
+            <div className="bg-blue-50 p-4 rounded-md border border-blue-200">
+              <label className="inline-flex items-center">
+                <input
+                  type="checkbox"
+                  className="form-checkbox text-blue-600 rounded focus:ring-blue-500"
+                  checked={policySelections.single_key}
+                  onChange={(e) => handlePolicyChange('single_key', e.target.checked)}
+                />
+                <span className="ml-2 text-gray-800 font-medium">Single Key (`pk(KEY)`)</span>
+              </label>
+              <div className="mt-3 text-sm text-gray-600">Requires one private key signature.</div>
+            </div>
+
+            {/* Multi-Signature */}
+            <div className="bg-green-50 p-4 rounded-md border border-green-200">
+              <label className="inline-flex items-center">
+                <input
+                  type="checkbox"
+                  className="form-checkbox text-green-600 rounded focus:ring-green-600"
+                  checked={policySelections.multisig.selected}
+                  onChange={(e) => handlePolicyChange('multisig', e.target.checked)}
+                />
+                <span className="ml-2 text-gray-800 font-medium">Multi-Signature (`multi(M, KEY_1, ..., KEY_N)`)</span>
+              </label>
+               <div className="mt-3 text-sm text-gray-600">Requires M out of N private key signatures.</div>
+               {policySelections.multisig.selected && (
+                   <div className="mt-4">
+                      <label htmlFor="multisig-m" className="block text-sm font-medium text-gray-700">Required signatures (M):</label>
+                      <input
+                        type="number"
+                        id="multisig-m"
+                        name="multisig-m"
+                        min={1}
+                        value={policySelections.multisig.m}
+                        onChange={(e) => handlePolicyParameterChange('multisig', 'm', parseInt(e.target.value))}
+                        className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-green-500 focus:ring-green-500 sm:text-sm"
+                      />
+                   </div>
+               )}
+                {policySelections.multisig.selected && (
+                   <div className="mt-2">
+                       <label htmlFor="multisig-n" className="block text-sm font-medium text-gray-700">Total keys (N):</label>
+                       <input
+                         type="number"
+                         id="multisig-n"
+                         name="multisig-n"
+                         min={1}
+                         value={policySelections.multisig.n}
+                         onChange={(e) => handlePolicyParameterChange('multisig', 'n', parseInt(e.target.value))}
+                         className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-green-500 focus:ring-green-500 sm:text-sm"
+                       />
+                   </div>
+                )}
+            </div>
+
+            {/* Timelock */}
+             <div className="bg-yellow-50 p-4 rounded-md border border-yellow-200">
+                <label className="inline-flex items-center">
+                    <input
+                      type="checkbox"
+                      className="form-checkbox text-yellow-600 rounded focus:ring-yellow-600"
+                      checked={policySelections.timelock.selected}
+                      onChange={(e) => handlePolicyChange('timelock', e.target.checked)}
+                    />
+                    <span className="ml-2 text-gray-800 font-medium">Timelock (`after(N)` or `older(N)`)</span>
+                </label>
+                 <div className="mt-3 text-sm text-gray-600">Funds spendable only after a specific time or block height.</div>
+                 {policySelections.timelock.selected && (
+                     <div className="mt-4">
+                         <label htmlFor="timelock-type" className="block text-sm font-medium text-gray-700">Timelock Type:</label>
+                         <select
+                           id="timelock-type"
+                           name="timelock-type"
+                           value={policySelections.timelock.type}
+                           onChange={(e) => handlePolicyParameterChange('timelock', 'type', e.target.value as 'absolute' | 'relative')}
+                           className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-yellow-500 focus:ring-yellow-500 sm:text-sm"
+                         >
+                             <option value="absolute">Absolute (Block Height or Unix Timestamp)</option>
+                             <option value="relative">Relative (Blocks since confirmation)</option>
+                         </select>
+                     </div>
+                 )}
+                  {policySelections.timelock.selected && (
+                     <div className="mt-2">
+                         <label htmlFor="timelock-value" className="block text-sm font-medium text-gray-700">Value:</label>
+                         <input
+                           type="text"
+                           id="timelock-value"
+                           name="timelock-value"
+                           placeholder="e.g., 850000 (block) or 1733400000 (timestamp) or 100 (relative blocks)"
+                           value={policySelections.timelock.value}
+                           onChange={(e) => handlePolicyParameterChange('timelock', 'value', e.target.value)}
+                           className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-yellow-500 focus:ring-yellow-500 sm:text-sm"
+                         />
+                     </div>
+                  )}
+            </div>
+
+            {/* Hashlock */}
+             <div className="bg-red-50 p-4 rounded-md border border-red-200">
+                <label className="inline-flex items-center">
+                    <input
+                      type="checkbox"
+                      className="form-checkbox text-red-600 rounded focus:ring-red-600"
+                      checked={policySelections.hashlock.selected}
+                      onChange={(e) => handlePolicyChange('hashlock', e.target.checked)}
+                    />
+                    <span className="ml-2 text-gray-800 font-medium">Hashlock (`sha256(H)`, etc.)</span>
+                </label>
+                 <div className="mt-3 text-sm text-gray-600">Requires revealing a secret preimage that matches a hash.</div>
+                 {policySelections.hashlock.selected && (
+                     <div className="mt-4">
+                         <label htmlFor="hashlock-algorithm" className="block text-sm font-medium text-gray-700">Hash Algorithm:</label>
+                         <select
+                           id="hashlock-algorithm"
+                           name="hashlock-algorithm"
+                           value={policySelections.hashlock.algorithm}
+                           onChange={(e) => handlePolicyParameterChange('hashlock', 'algorithm', e.target.value as any)}
+                           className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-red-500 focus:ring-red-500 sm:text-sm"
+                         >
+                             <option value="sha256">SHA256</option>
+                             <option value="hash256">HASH256 (SHA256 twice)</option>
+                             <option value="ripemd160">RIPEMD160</option>
+                             <option value="hash160">HASH160 (SHA256 then RIPEMD160)</option>
+                         </select>
+                     </div>
+                 )}
+                  {policySelections.hashlock.selected && (
+                     <div className="mt-2">
+                         <label htmlFor="hashlock-hash" className="block text-sm font-medium text-gray-700">Hash Value (hex):</label>
+                         <input
+                           type="text"
+                           id="hashlock-hash"
+                           name="hashlock-hash"
+                           placeholder="e.g., b03e3f..."
+                           value={policySelections.hashlock.hash}
+                           onChange={(e) => handlePolicyParameterChange('hashlock', 'hash', e.target.value)}
+                           className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-red-500 focus:ring-red-500 sm:text-sm"
+                         />
+                     </div>
+                  )}
+            </div>
+
+             {/* Vault (Pre-defined combination example) */}
+             <div className="bg-purple-50 p-4 rounded-md border border-purple-200">
+                <label className="inline-flex items-center">
+                    <input
+                      type="checkbox"
+                      className="form-checkbox text-purple-600 rounded focus:ring-purple-600"
+                      checked={policySelections.vault.selected}
+                      onChange={(e) => handlePolicyChange('vault', e.target.checked)}
+                    />
+                    <span className="ml-2 text-gray-800 font-medium">Vault (Delay + Cancel)</span>
+                </label>
+                 <div className="mt-3 text-sm text-gray-600">A common pattern with a delay and a separate cancel key. Policy: <code>or(and(pk(DEST), after(DELAY)), pk(CANCEL))</code></div>
+                 {policySelections.vault.selected && (
+                     <div className="mt-4">
+                         <label htmlFor="vault-delay" className="block text-sm font-medium text-gray-700">Delay (Blocks or Timestamp):</label>
+                         <input
+                           type="text"
+                           id="vault-delay"
+                           name="vault-delay"
+                           placeholder="e.g., 850000"
+                           value={policySelections.vault.delay}
+                           onChange={(e) => handlePolicyParameterChange('vault', 'delay', e.target.value)}
+                           className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-purple-500 focus:ring-purple-500 sm:text-sm"
+                         />
+                     </div>
+                 )}
+                  {policySelections.vault.selected && (
+                     <div className="mt-2">
+                         <label htmlFor="vault-dest-key" className="block text-sm font-medium text-gray-700">Destination Key (xpub/pubkey):</label>
+                         <input
+                           type="text"
+                           id="vault-dest-key"
+                           name="vault-dest-key"
+                           placeholder="e.g., xpubA/0/*"
+                           value={policySelections.vault.destKey}
+                           onChange={(e) => handlePolicyParameterChange('vault', 'destKey', e.target.value)}
+                           className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-purple-500 focus:ring-purple-500 sm:text-sm"
+                         />
+                     </div>
+                  )}
+                   {policySelections.vault.selected && (
+                     <div className="mt-2">
+                         <label htmlFor="vault-cancel-key" className="block text-sm font-medium text-gray-700">Cancel Key (xpub/pubkey):</label>
+                         <input
+                           type="text"
+                           id="vault-cancel-key"
+                           name="vault-cancel-key"
+                           placeholder="e.g., xpubB/0/*"
+                           value={policySelections.vault.cancelKey}
+                           onChange={(e) => handlePolicyParameterChange('vault', 'cancelKey', e.target.value)}
+                           className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-purple-500 focus:ring-purple-500 sm:text-sm"
+                         />
+                     </div>
+                   )}
+            </div>
+
+          </div>
+        </div>
+
+         {/* Key Input Section (for selected policies) */}
+        <div className="mb-8 border-b pb-6">
+          <h2 className="text-xl font-semibold mb-4 text-gray-700">2. Enter Key Details</h2>
+           <p className="mb-4 text-gray-600 text-sm">Provide the public keys or extended public keys (xpubs) for the participants in your selected policies. Use xpubs with derivation paths (e.g., `xpub.../0/*`) for wallet compatibility.</p>
+           <div id="key-inputs-container" className="space-y-4">
+               {keyInputs.map(keyInput => (
+                   <div key={keyInput.id} className="bg-gray-50 p-4 rounded-md border border-gray-200">
+                       <label htmlFor={`key-${keyInput.id}`} className="block text-sm font-medium text-gray-700">Key {keyInput.id} (xpub/pubkey):</label>
+                       <input
+                           type="text"
+                           id={`key-${keyInput.id}`}
+                           name={`key-${keyInput.id}`}
+                           placeholder="Enter xpub or public key"
+                           value={keyInput.value}
+                           onChange={(e) => handleKeyInputChange(keyInput.id, e.target.value)}
+                           className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
+                       />
+                   </div>
+               ))}
+           </div>
+           <button
+               id="add-key-button"
+               onClick={addKeyInput}
+               className="mt-4 inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+           >
+               Add Another Key
+           </button>
+        </div>
+
+
+         {/* Policy Combination Section */}
+        <div className="mb-8 border-b pb-6">
+          <h2 className="text-xl font-semibold mb-4 text-gray-700">3. Combine Policies (Optional)</h2>
+           <p className="mb-4 text-gray-600 text-sm">If you selected multiple policy types above, choose how to combine them logically. For complex combinations, you might need to manually input the policy string.</p>
+           <div className="space-y-4">
+               <div>
+                   <label className="inline-flex items-center">
+                       <input
+                         type="radio"
+                         name="combination-type"
+                         value="and"
+                         checked={combinationType === 'and'}
+                         onChange={() => handleCombinationTypeChange('and')}
+                         className="form-radio text-blue-600 focus:ring-blue-500"
+                       />
+                       <span className="ml-2 text-gray-800 font-medium">AND</span>
+                   </label>
+                   <p className="text-sm text-gray-600 ml-6">All selected conditions must be met.</p>
+               </div>
+                <div>
+                   <label className="inline-flex items-center">
+                       <input
+                         type="radio"
+                         name="combination-type"
+                         value="or"
+                         checked={combinationType === 'or'}
+                         onChange={() => handleCombinationTypeChange('or')}
+                         className="form-radio text-green-600 focus:ring-green-500"
+                       />
+                       <span className="ml-2 text-gray-800 font-medium">OR</span>
+                   </label>
+                    <p className="text-sm text-gray-600 ml-6">At least one of the selected conditions must be met.</p>
+               </div>
+                <div>
+                   <label className="inline-flex items-center">
+                       <input
+                         type="radio"
+                         name="combination-type"
+                         value="threshold"
+                         checked={combinationType === 'threshold'}
+                         onChange={() => handleCombinationTypeChange('threshold')}
+                         className="form-radio text-yellow-600 focus:ring-yellow-500"
+                       />
+                       <span className="ml-2 text-gray-800 font-medium">Threshold (K-of-N Policies)</span>
+                   </label>
+                    <p className="text-sm text-gray-600 ml-6">A specific number of selected policies must be met.</p>
+                     {combinationType === 'threshold' && (
+                         <div className="mt-2 ml-6">
+                           <label htmlFor="threshold-k" className="block text-sm font-medium text-gray-700">Required Policies (K):</label>
+                           <input
+                             type="number"
+                             id="threshold-k"
+                             name="threshold-k"
+                             min={1}
+                             value={thresholdK}
+                             onChange={(e) => setThresholdK(parseInt(e.target.value))}
+                             className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-yellow-500 focus:ring-yellow-500 sm:text-sm"
+                           />
+                       </div>
+                     )}
+               </div>
+                <div>
+                   <label className="inline-flex items-center">
+                       <input
+                         type="radio"
+                         name="combination-type"
+                         value="custom"
+                         checked={combinationType === 'custom'}
+                         onChange={() => handleCombinationTypeChange('custom')}
+                         className="form-radio text-red-600 focus:ring-red-500"
+                       />
+                       <span className="ml-2 text-gray-800 font-medium">Custom Policy String</span>
+                   </label>
+                    <p className="mb-2 text-sm text-gray-600 ml-6">Input the Miniscript policy string directly (e.g., <code>or(pk(A),and(pk(B),after(100)))</code>).</p>
+                     {combinationType === 'custom' && (
+                         <div className="mt-2 ml-6">
+                           <label htmlFor="custom-policy-string" className="block text-sm font-medium text-gray-700">Policy String:</label>
+                           <textarea
+                             id="custom-policy-string"
+                             name="custom-policy-string"
+                             rows={3}
+                             value={customPolicyString}
+                             onChange={(e) => setCustomPolicyString(e.target.value)}
+                             className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-red-500 focus:ring-red-500 sm:text-sm"
+                             placeholder="Enter your Miniscript policy string here..."
+                           ></textarea>
+                       </div>
+                     )}
+               </div>
+           </div>
+        </div>
+
+        {/* Output Descriptor Type Selection */}
+        <div className="mb-8 border-b pb-6">
+           <h2 className="text-xl font-semibold mb-4 text-gray-700">4. Select Output Descriptor Type</h2>
+            <div className="space-y-2">
+                <div>
+                    <label className="inline-flex items-center">
+                        <input
+                          type="radio"
+                          name="descriptor-type"
+                          value="wsh"
+                          checked={descriptorType === 'wsh'}
+                          onChange={() => handleDescriptorTypeChange('wsh')}
+                          className="form-radio text-blue-600 focus:ring-blue-500"
+                        />
+                        <span className="ml-2 text-gray-800 font-medium">WSH (P2WSH - Recommended)</span>
+                    </label>
+                     <p className="text-sm text-gray-600 ml-6">Native SegWit Script Hash. Efficient and standard.</p>
+                </div>
+                 <div>
+                    <label className="inline-flex items-center">
+                        <input
+                          type="radio"
+                          name="descriptor-type"
+                          value="sh_wsh"
+                          checked={descriptorType === 'sh_wsh'}
+                          onChange={() => handleDescriptorTypeChange('sh_wsh')}
+                          className="form-radio text-green-600 focus:ring-green-500"
+                        />
+                        <span className="ml-2 text-gray-800 font-medium">SH(WSH) (P2SH-P2WSH)</span>
+                    </label>
+                     <p className="text-sm text-gray-600 ml-6">Nested SegWit Script Hash. For broader compatibility with older wallets.</p>
+                </div>
+                 <div>
+                    <label className="inline-flex items-center">
+                        <input
+                          type="radio"
+                          name="descriptor-type"
+                          value="tr"
+                          checked={descriptorType === 'tr'}
+                          onChange={() => handleDescriptorTypeChange('tr')}
+                          className="form-radio text-purple-600 focus:ring-purple-500"
+                        />
+                        <span className="ml-2 text-gray-800 font-medium">TR (P2TR - Taproot)</span>
+                    </label>
+                     <p className="text-sm text-gray-600 ml-6">Taproot. Offers privacy and efficiency benefits (requires Taproot-compatible wallets/nodes).</p>
+                  </div>
+              </div>
+        </div>
+
+        {/* Error Message */}
+        {error && (
+            <div className="mb-4 p-4 bg-red-100 border border-red-400 text-red-700 rounded-md">
+                {error}
+            </div>
+        )}
+
+
+        {/* Generate Descriptor Button */}
+        <div className="text-center">
+            <button
+                id="generate-button"
+                onClick={handleGenerateDescriptor}
+                className="inline-flex items-center px-6 py-3 border border-transparent text-base font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+            >
+                Generate Descriptor
+            </button>
+        </div>
+
+        {/* Generated Descriptor Output Section */}
+        {showOutput && (
+            <div id="output-section" className="mt-8 p-6 bg-gray-50 rounded-md border border-gray-200">
+                <h2 className="text-xl font-semibold mb-4 text-gray-700">Generated Descriptor</h2>
+                <div className="mb-4">
+                    <label htmlFor="generated-descriptor" className="block text-sm font-medium text-gray-700">Descriptor String:</label>
+                    <textarea
+                        id="generated-descriptor"
+                        name="generated-descriptor"
+                        rows={4}
+                        readOnly
+                        value={generatedDescriptor}
+                        className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm bg-white cursor-text"
+                    ></textarea>
+                </div>
+                 <div className="mb-4">
+                    <label htmlFor="example-address" className="block text-sm font-medium text-gray-700">Example Address:</label>
+                    <input
+                        type="text"
+                        id="example-address"
+                        name="example-address"
+                        readOnly
+                        value={exampleAddress}
+                        className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm bg-white cursor-text"
+                    />
+                </div>
+                 <div>
+                    <h3 className="text-lg font-medium mb-2 text-gray-700">Spending Conditions Summary:</h3>
+                    <p id="spending-conditions-summary" className="text-gray-600 text-sm whitespace-pre-wrap">{spendingConditionsSummary}</p>
+                </div>
+            </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
