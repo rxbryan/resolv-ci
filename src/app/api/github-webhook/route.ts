@@ -1,62 +1,105 @@
-// app/api/github-webhook/route.ts
-import { NextRequest, NextResponse } from 'next/server';
-import crypto from 'crypto';
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET as string;
+import crypto from "node:crypto";
+import { NextRequest, NextResponse } from "next/server";
+import { recordWebhookDelivery, logBuildFailure } from "@/lib/tidb";
 
-// Helper function to read the raw body from the request
-const buffer = async (readable: NextRequest): Promise<Buffer> => {
-  const reader = readable.body?.getReader();
-  if (!reader) {
-    throw new Error('ReadableStream reader is not available.');  // Handle this
-  }
-  const chunks: Uint8Array[] = [];
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-    if (value) {
-      chunks.push(value);
-    }
-  }
-  return Buffer.concat(chunks);
-};
+async function raw(req: NextRequest): Promise<Buffer> {
+  const ab = await req.arrayBuffer();
+  return Buffer.from(ab);
+}
+function tEq(a: string, b: string) {
+  const A = Buffer.from(a), B = Buffer.from(b);
+  return A.length === B.length && crypto.timingSafeEqual(A, B);
+}
 
 export async function POST(req: NextRequest) {
-  // Verify the webhook signature
-  const signature = req.headers.get('x-hub-signature-256');
-  if (!signature || signature) { // always fail for now
-    console.error('Request received without a signature. Aborting.');
-    return NextResponse.json({ error: 'Signature missing' }, { status: 401 });
-  }
+  try {
+    const sig = req.headers.get("x-hub-signature-256");
+    if (!sig) return NextResponse.json({ error: "signature missing" }, { status: 401 });
 
-  const rawBody = await buffer(req);
-  const hmac = crypto.createHmac('sha256', GITHUB_WEBHOOK_SECRET);
-  const digest = 'sha256=' + hmac.update(rawBody).digest('hex');
+    const body = await raw(req);
+    const digest = "sha256=" + crypto.createHmac("sha256", process.env.GITHUB_WEBHOOK_SECRET ?? "").update(body).digest("hex");
+    if (!tEq(digest, sig)) return NextResponse.json({ error: "invalid signature" }, { status: 401 });
 
-  if (digest !== signature) {
-    console.error('Signature mismatch. Request is not from GitHub.');
-    return NextResponse.json({ error: 'Invalid signature' }, { status: 401 });
-  }
+    const payload = JSON.parse(body.toString("utf-8"));
+    const eventType = req.headers.get("x-github-event") ?? "";
+    const deliveryId = req.headers.get("x-github-delivery") ?? "";
 
-  // Parse the payload from the raw body
-  const payload = JSON.parse(rawBody.toString());
-  const event = req.headers.get('x-github-event');
-
-  console.log(`Received GitHub event: ${event}`);
-
-  // Handle 'check_run' event
-  if (event === 'check_run') {
-    const { action, check_run } = payload;
-    console.log(`Check run action: ${action}`);
-
-    if (check_run.conclusion === 'failure') {
-      console.log('Detected a failed check run. Analyzing...');
-      // TODO: Here is where you would call your agentic AI to analyze the logs
+    const event = req.headers.get("x-github-event");
+    if (event === "check_run") {
+      const action = payload.action;               // expect "completed"
+      const conclusion = payload.check_run?.conclusion; // expect "failure"
+      if (action !== "completed" || conclusion !== "failure") {
+        return NextResponse.json({ ok: true, ignored: "check_run not completed failure" });
+      }
+    } else if (event === "workflow_run") {
+      const action = payload.action;               // expect "completed"
+      const conclusion = payload.workflow_run?.conclusion; // expect "failure"
+      if (action !== "completed" || conclusion !== "failure") {
+        return NextResponse.json({ ok: true, ignored: "workflow_run not completed failure" });
+      }
     }
-  }
 
-  // Acknowledge the webhook
-  return NextResponse.json({ message: 'Webhook received and processed.' }, { status: 200 });
+    const first = await recordWebhookDelivery(deliveryId, eventType, payload);
+    if (!first) return NextResponse.json({ ok: true, deduped: true });
+
+    const repoOwner = payload.repository?.owner?.login ?? payload.org?.login ?? "unknown";
+    const repoName  = payload.repository?.name ?? "unknown";
+    const prNumber  =
+      payload.check_run?.pull_requests?.[0]?.number ??
+      payload.workflow_run?.pull_requests?.[0]?.number ??
+      payload.pull_request?.number ??
+      (payload.issue?.pull_request ? payload.issue?.number : null) ??
+      null;
+
+    const headSha   =
+      payload.check_run?.head_sha ??
+      payload.workflow_run?.head_sha ??
+      payload.pull_request?.head?.sha ??
+      payload.after ??
+      "unknown";
+
+    const runId     =
+      (payload.check_run?.id && String(payload.check_run.id)) ||
+      (payload.workflow_run?.id && String(payload.workflow_run.id)) ||
+      null;
+
+    let logExcerpt = `event=${eventType} delivery=${deliveryId}`;
+    if (eventType === "check_run") {
+      logExcerpt = payload.check_run?.output?.summary ?? payload.check_run?.output?.text ?? logExcerpt;
+    } else if (eventType === "workflow_run") {
+      logExcerpt = payload.workflow_run?.display_title ? `workflow_run: ${payload.workflow_run.display_title}` : logExcerpt;
+    } else if (eventType === "pull_request_review_comment") {
+      logExcerpt = `PR review comment by ${payload.comment?.user?.login}:
+${payload.comment?.body ?? ""}`;
+    } else if (eventType === "issue_comment" && payload.issue?.pull_request) {
+      logExcerpt = `PR comment by ${payload.comment?.user?.login}:
+${payload.comment?.body ?? ""}`;
+    }
+
+    // Github sometimes makes multiple calls to this endpoint: 
+    console.log(`[webhook] delivery=${deliveryId} runId=${runId} action=${payload.action} ev=${eventType}`);
+
+    await logBuildFailure({
+      repoOwner, repoName, prNumber, commitSha: headSha, logContent: logExcerpt, runId
+    });
+
+    const base = process.env.NEXT_PUBLIC_BASE_URL;
+    const secret = process.env.CRON_SECRET;
+    if (base && secret) {
+      fetch(`${base}/api/graph-run`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${secret}` },
+        // @ts-expect-error keepalive ok in Node 18+
+        keepalive: true,
+      }).catch(() => {});
+    }
+
+    return NextResponse.json({ ok: true });
+  } catch (err: any) {
+    console.error("webhook error:", err);
+    return NextResponse.json({ error: "internal", detail: String(err?.message ?? err) }, { status: 500 });
+  }
 }
