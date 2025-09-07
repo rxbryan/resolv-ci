@@ -47,47 +47,73 @@ function isTransient(e: any) {
 }
 
 
-// --- BuildFailure ---
-export class BuildFailure extends Model<
-  InferAttributes<BuildFailure>,
-  InferCreationAttributes<BuildFailure>
-> {
-  declare failure_id: CreationOptional<number>;
-  declare run_id: string | null;
-  declare repo_owner: string;
-  declare repo_name: string;
-  declare pr_number: number | null;
-  declare commit_sha: string;
-  declare log_content: string | null;
-  declare status: "new" | "analyzing" | "proposed" | "applied" | "skipped";
-  declare failure_timestamp: CreationOptional<Date>;
-}
-
-if (!sequelize.models.build_failures) {
-  BuildFailure.init(
-    {
-      failure_id: { type: DataTypes.BIGINT, primaryKey: true, autoIncrement: true },
-      run_id: { type: DataTypes.STRING(128), unique: true, allowNull: true },
-      repo_owner: { type: DataTypes.STRING(200), allowNull: false },
-      repo_name: { type: DataTypes.STRING(200), allowNull: false },
-      pr_number: { type: DataTypes.INTEGER, allowNull: true },
-      commit_sha: { type: DataTypes.STRING(64), allowNull: false },
-      log_content: { type: DataTypes.TEXT("long"), allowNull: true },
-      status: {
-        type: DataTypes.ENUM("new", "analyzing", "proposed", "applied", "skipped"),
-        defaultValue: "new",
-        allowNull: false
-      },
-      failure_timestamp: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
-    },
-    { sequelize, modelName: "build_failures", tableName: "build_failures", timestamps: false }
-  );
-}
-
 /**
- * Switch just WebhookEvent to sequelize.define(...) (no classes), keep classes for the other models.
+ * Switch just WebhookEvent and buildfailure to sequelize.define(...) (no classes), keep classes for the other models.
  * This avoids class identity problems for the high-churn webhook path.
  */
+// --- BuildFailure (sequelize.define) ---
+export const BuildFailure =
+  (sequelize.models.build_failures as any) ??
+  sequelize.define(
+    "build_failures",
+    {
+      failure_id: {
+        type: DataTypes.BIGINT,
+        primaryKey: true,
+        autoIncrement: true,
+      },
+      run_id: {
+        type: DataTypes.STRING(128),
+        allowNull: true,
+        unique: true,
+      },
+      repo_owner: {
+        type: DataTypes.STRING(200),
+        allowNull: false,
+      },
+      repo_name: {
+        type: DataTypes.STRING(200),
+        allowNull: false,
+      },
+      pr_number: {
+        type: DataTypes.INTEGER,
+        allowNull: true,
+      },
+      commit_sha: {
+        type: DataTypes.STRING(64),
+        allowNull: false,
+      },
+      log_content: {
+        type: DataTypes.TEXT("long"),
+        allowNull: true,
+      },
+      installation_id: {
+        type: DataTypes.BIGINT,
+        allowNull: true,
+      },
+      status: {
+        type: DataTypes.ENUM("new", "analyzing", "proposed", "applied", "skipped"),
+        allowNull: false,
+        defaultValue: "new",
+      },
+      failure_timestamp: {
+        type: DataTypes.DATE,
+        allowNull: false,
+        defaultValue: DataTypes.NOW,
+      },
+    },
+    {
+      tableName: "build_failures",
+      timestamps: false,
+      indexes: [
+        { fields: ["repo_owner", "repo_name"] },
+        { unique: true, fields: ["run_id"] },
+      ],
+    }
+  );
+
+
+
 export const WebhookEvent =
   sequelize.models.webhook_events ??
   sequelize.define("webhook_events", {
@@ -127,6 +153,7 @@ export async function recordWebhookDelivery(deliveryId: string, eventType: strin
  * - If runId present: INSERT ... ON DUPLICATE KEY UPDATE no-op (keeps existing row untouched)
  * - If no runId: plain insert (NULL is allowed multiple times in UNIQUE in MySQL)
  */
+
 export async function logBuildFailure(params: {
   repoOwner: string;
   repoName: string;
@@ -134,6 +161,7 @@ export async function logBuildFailure(params: {
   commitSha: string;
   logContent: string;
   runId?: string | null;
+  installationId?: number | null;
 }) {
   const MAX_RETRIES = 3;
   let attempt = 0;
@@ -146,23 +174,25 @@ export async function logBuildFailure(params: {
     commit_sha: params.commitSha,
     log_content: params.logContent,
     status: "new" as const,
+    installation_id: params.installationId ?? null, // ⬅️ NEW
   };
 
-
-  // If we have a runId, do a no-op upsert to avoid changing existing row/status
+  // If we have a runId, do an idempotent upsert.
+  // Keep existing row as-is; only backfill installation_id if it was NULL.
   if (params.runId) {
     const q = `
       INSERT INTO build_failures
-        (run_id, repo_owner, repo_name, pr_number, commit_sha, log_content, status)
+        (run_id, repo_owner, repo_name, pr_number, commit_sha, log_content, status, installation_id)
       VALUES
-        (:run_id, :repo_owner, :repo_name, :pr_number, :commit_sha, :log_content, :status)
+        (:run_id, :repo_owner, :repo_name, :pr_number, :commit_sha, :log_content, :status, :installation_id)
       ON DUPLICATE KEY UPDATE
-        run_id = run_id  -- no-op; preserves existing row
+        run_id = run_id,                                -- no-op
+        installation_id = IFNULL(installation_id, VALUES(installation_id))  -- backfill if null
     `;
     while (true) {
       try {
         await sequelize.query(q, { replacements: values });
-        return; // success or duplicate treated as success
+        return; // success (insert) or treated-as-success (duplicate)
       } catch (e: any) {
         attempt++;
         if (!isTransient(e) || attempt >= MAX_RETRIES) throw e;
@@ -177,8 +207,7 @@ export async function logBuildFailure(params: {
       await BuildFailure.create(values as any);
       return;
     } catch (e: any) {
-      // Duplicate on NULL run_id shouldn't happen; but just in case:
-      if (e instanceof UniqueConstraintError) return;
+      if (e instanceof UniqueConstraintError) return; // extremely unlikely when run_id is NULL
       attempt++;
       if (!isTransient(e) || attempt >= MAX_RETRIES) throw e;
       await new Promise(r => setTimeout(r, 1000 * attempt));
