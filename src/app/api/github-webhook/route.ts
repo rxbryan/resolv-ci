@@ -31,6 +31,7 @@ export async function POST(req: NextRequest) {
     if (event === "check_run") {
       const action = payload.action;               // expect "completed"
       const conclusion = payload.check_run?.conclusion; // expect "failure"
+
       if (action !== "completed" || conclusion !== "failure") {
         return NextResponse.json({ ok: true, ignored: "check_run not completed failure" });
       }
@@ -41,11 +42,14 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: true, ignored: "workflow_run not completed failure" });
       }
     }
+    else {// ignore anything else
+      return NextResponse.json({ ok: true, ignored: "" });
+    }
 
     const first = await recordWebhookDelivery(deliveryId, eventType, payload);
     if (!first) return NextResponse.json({ ok: true, deduped: true });
 
-    const repoOwner = payload.repository?.owner?.login ?? payload.org?.login ?? "unknown";
+    const repoOwner = payload.repository?.owner?.login ?? "unknown";
     const repoName  = payload.repository?.name ?? "unknown";
     const prNumber  =
       payload.check_run?.pull_requests?.[0]?.number ??
@@ -54,17 +58,19 @@ export async function POST(req: NextRequest) {
       (payload.issue?.pull_request ? payload.issue?.number : null) ??
       null;
 
+      console.log(`[webhook] [Event]: PrNumber:${prNumber}`)
+
     const headSha   =
-      payload.check_run?.head_sha ??
       payload.workflow_run?.head_sha ??
+      payload.check_run?.head_sha ??
       payload.pull_request?.head?.sha ??
       payload.after ??
       "unknown";
 
-    const runId     =
-      (payload.check_run?.id && String(payload.check_run.id)) ||
-      (payload.workflow_run?.id && String(payload.workflow_run.id)) ||
-      null;
+    const runId  = (payload.workflow_run?.id && String(payload.workflow_run.id)) ||
+      null;  // not really needed here
+
+    const installationId: number | null = payload.installation?.id ?? null;
 
     let logExcerpt = `event=${eventType} delivery=${deliveryId}`;
     if (eventType === "check_run") {
@@ -83,11 +89,14 @@ ${payload.comment?.body ?? ""}`;
     console.log(`[webhook] delivery=${deliveryId} runId=${runId} action=${payload.action} ev=${eventType}`);
 
     await logBuildFailure({
-      repoOwner, repoName, prNumber, commitSha: headSha, logContent: logExcerpt, runId
+      repoOwner, repoName, prNumber, commitSha: headSha,
+      logContent: logExcerpt, runId,
+      installationId,
     });
 
-    const base = process.env.NEXT_PUBLIC_BASE_URL;
+    const base = (process.env.NODE_ENV === "development")? `${process.env.DEV_URL}`: req.nextUrl.origin;
     const secret = process.env.CRON_SECRET;
+    console.log(`webhook: calling ${base}/api/graph-run with cron: ${secret}`)
     if (base && secret) {
       fetch(`${base}/api/graph-run`, {
         method: "POST",
