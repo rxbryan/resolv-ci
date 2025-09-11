@@ -5,18 +5,6 @@ create table if not exists webhook_events (
   received_at timestamp default current_timestamp
 );
 
-create table if not exists build_failures (
-  failure_id bigint primary key auto_increment,
-  run_id varchar(128) unique,
-  repo_owner varchar(200),
-  repo_name varchar(200),
-  pr_number int,
-  commit_sha varchar(64),
-  log_content longtext,
-  status enum('new','analyzing','proposed','applied','skipped') default 'new',
-  failure_timestamp timestamp default current_timestamp
-);
-
 create table if not exists outbound_actions (
   id bigint primary key auto_increment,
   action_hash char(64) unique not null,

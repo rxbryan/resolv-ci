@@ -3,29 +3,40 @@ export const dynamic = "force-dynamic";
 
 import { NextRequest, NextResponse } from "next/server";
 import yauzl from "yauzl";
-import { sequelize, BuildFailure } from "@/lib/tidb";
-import { getOctokitForContext, findLatestRunForPR } from "@/lib/github";
-//import { ResolvGraphApp } from "@/agents/graph";
+import {
+  sequelize,
+  BuildFailure,
+} from "@/lib/tidb";
+
+import { normalize, tailLines, templateize, sha1 } from "@/lib/text";
+
+import {
+  getOctokitForInstallation,
+  getOctokitForRepo,
+  findLatestRunForPR,
+} from "@/lib/github";
+
+import { ResolvGraphApp } from "@/agents/graph";
 
 function authorized(req: NextRequest) {
   return req.headers.get("authorization") === `Bearer ${process.env.CRON_SECRET}`;
 }
+
 
 async function streamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of stream) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   return Buffer.concat(chunks);
 }
+
+
 function tailBytes(buf: Buffer, n: number): Buffer {
   if (buf.length <= n) return buf;
   return buf.subarray(buf.length - n);
 }
-function tailLines(s: string, n: number) {
-  const lines = (s || "").split("\n");
-  return lines.slice(-n).join("\n");
-}
 
-async function unzipTxtWithYauzl(
+
+async function unzipLogArchive(
   zipBuffer: Buffer,
   opts?: { maxFiles?: number; tailPerFileBytes?: number; maxCombinedBytes?: number }
 ) {
@@ -104,10 +115,13 @@ export async function downloadPRLogs(
   return Buffer.from(String(data ?? ""), "utf8");
 }
 
-export async function POST(req: NextRequest) {
-  if (!authorized(req)) return NextResponse.json({ error: "forbidden" }, { status: 403 });
 
-  // Claim one "new" failure row
+export async function POST(req: NextRequest) {
+  if (req.headers.get("authorization") !== `Bearer ${process.env.CRON_SECRET}`) {
+    return NextResponse.json({ error: "forbidden" }, { status: 403 });
+  }
+
+  // Claim a row
   const t = await sequelize.transaction();
   let f: any | null = null;
   try {
@@ -115,9 +129,12 @@ export async function POST(req: NextRequest) {
       where: { status: "new" },
       order: [["failure_timestamp", "ASC"]],
       transaction: t,
-      lock: t.LOCK.UPDATE
+      lock: t.LOCK.UPDATE,
     });
-    if (!f) { await t.rollback(); return NextResponse.json({ ok: true, msg: "idle" }); }
+    if (!f) {
+      await t.rollback();
+      return NextResponse.json({ ok: true, msg: "idle" });
+    }
     await f.update({ status: "analyzing" }, { transaction: t });
     await t.commit();
   } catch (err) {
@@ -128,91 +145,119 @@ export async function POST(req: NextRequest) {
 
   try {
     const failure = f.toJSON() as {
+      failure_id: number;
       repo_owner: string;
       repo_name: string;
       pr_number: number;
       commit_sha: string;
-      log_content?: string;
-      run_id?: string | null;
-      failure_id: number;
-      installation_id?: number | null; // ⬅️ include
+      log_content?: string | null;
+      installation_id?: number | null;
+      error_signature_v1?: string | null;
+      error_signature_v2?: string | null;
+      norm_tail?: string | null;
     };
 
-    console.log(`[graph-run] ${failure}`);
+    const octo =
+      failure.installation_id != null
+        ? await getOctokitForInstallation(Number(failure.installation_id))
+        : await getOctokitForRepo(failure.repo_owner, failure.repo_name);
 
-
-    // Get installation-scoped Octokit (use stored installation if present; else resolve by repo)
-    const octo = await getOctokitForContext(
-      failure.repo_owner,
-      failure.repo_name,
-      failure.installation_id ?? null
-    );
-
-    
-    /**
-     * Best-effort: download + unzip logs
-     * Opens the ZIP with yauzl and iterates entries.
-     * Only processes *.txt files (step logs).
-     * For each log file, keeps only the last ~200 KB (tail), because the tail usually contains the error and stack traces.
-     * Stops after 40 files or ~2 MB total across all tails.
-     * From that combined text, keeps the last 800 lines (most recent, typically where the failure is).
-     * persist in tidb
-     */
+    // --- Download + unzip logs; then backfill tail + norm + signatures ---
     try {
-      const zipBuf = await downloadPRLogs(
+      const run = await findLatestRunForPR(
         octo,
         failure.repo_owner,
         failure.repo_name,
         failure.pr_number,
         failure.commit_sha
       );
-      const combined = await unzipTxtWithYauzl(zipBuf, {
+      if (!run) throw new Error(`No PR workflow run found for head_sha=${failure.commit_sha}`);
+
+      const { data } = await octo.rest.actions.downloadWorkflowRunLogs({
+        owner: failure.repo_owner,
+        repo: failure.repo_name,
+        run_id: run.id,
+      });
+
+      const zipBuf =
+        Buffer.isBuffer(data)
+          ? (data as Buffer)
+          : (data as any)?.pipe
+          ? await (async () => {
+              const chunks: Buffer[] = [];
+              for await (const chunk of (data as any)) {
+                chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+              }
+              return Buffer.concat(chunks);
+            })()
+          : (data as any)?.byteLength
+          ? Buffer.from(data as ArrayBuffer)
+          : Buffer.from(String(data ?? ""), "utf8");
+
+      const combined = await unzipLogArchive(zipBuf, {
         maxFiles: 40,
         tailPerFileBytes: 200_000,
         maxCombinedBytes: 2_000_000,
       });
-      await f.update({ log_content: tailLines(combined, 800) });
-      console.log(`[graph-run] [log content] ${tailLines(combined, 800)}`)
+
+      const tailed = tailLines(combined, 800);
+      const norm = normalize(tailLines(combined, 300));
+
+      const sigV1 = failure.error_signature_v1 ?? (norm ? sha1(norm) : null);
+      const sigV2 = failure.error_signature_v2 ?? (norm ? sha1(templateize(norm)) : null);
+      
+      await f.update({
+        log_content: tailed,
+        norm_tail: norm || null,
+        error_signature_v1: sigV1,
+        error_signature_v2: sigV2,
+      });
     } catch (e) {
       console.warn("log download/unzip skipped:", e);
     }
 
-    const fresh = await BuildFailure.findByPk(failure.failure_id).then(r => r?.toJSON());
-/*
-    // Run LangGraph — pass installation_id so the outbox stage can include it
+    const fresh = (await BuildFailure.findByPk(failure.failure_id))?.toJSON() ?? failure;
+
+    // Run the LangGraph app
     const result = await ResolvGraphApp.invoke({
-      repo_owner: failure.repo_owner,
-      repo_name: failure.repo_name,
-      pr_number: failure.pr_number ?? 0,
-      head_sha: failure.commit_sha,
-      log_content: (fresh ?? failure).log_content ?? "",
-      failure_id: failure.failure_id,
+      repo_owner: fresh.repo_owner,
+      repo_name: fresh.repo_name,
+      pr_number: fresh.pr_number,
+      head_sha: fresh.commit_sha,
+      log_content: fresh.log_content ?? "",
+      failure_id: fresh.failure_id,
+      installation_id: fresh.installation_id ?? null,
       insight_loops: 0,
-      installation_id: failure.installation_id ?? null,
+      messages: [],
     } as any);
 
     await f.update({ status: "proposed" });
 
-    // Trigger outbox dispatcher
-    const base = (process.env.NODE_ENV === "development")? `${process.env.DEV_URL}`: req.nextUrl.origin;
+    const base =
+      process.env.NEXT_PUBLIC_BASE_URL ||
+      `${req.headers.get("x-forwarded-proto") || (process.env.NODE_ENV === "development" ? "http" : "https")}://${req.headers.get("host")}`;
+
+    console.log(`[Graph-run] base url: ${base}`)
     const secret = process.env.CRON_SECRET;
     if (base && secret) {
       fetch(`${base}/api/dispatch-outbox`, {
         method: "POST",
         headers: { Authorization: `Bearer ${secret}` },
         // @ts-expect-error keepalive ok
-        keepalive: true
+        keepalive: true,
       }).catch(() => {});
     }
-*/
+
     return NextResponse.json({
       ok: true,
-      failure_id: failure.failure_id,
-      //loops: result?.insight_loops ?? 0
+      failure_id: fresh.failure_id,
+      loops: result?.insight_loops ?? 0,
     });
   } catch (err: any) {
     console.error("graph-run execution error:", err);
-    try { await f.update({ status: "skipped" }); } catch {}
+    try {
+      await f.update({ status: "skipped" });
+    } catch {}
     return NextResponse.json({ ok: false, error: String(err?.message ?? err) }, { status: 500 });
   }
 }
