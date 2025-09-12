@@ -9,6 +9,69 @@ const DEBUG = process.env.DEBUG_ACTUATOR === "1";
 const MAX_REVIEW_COMMENTS = Number(process.env.ACTUATOR_MAX_COMMENTS ?? "12");
 const BODY_MAX_CHARS = Number(process.env.ACTUATOR_BODY_MAX ?? "18000"); // keep margin under GH hard limit
 
+/* ============================== Helpers ============================== */
+
+function clampLen(s: string, max: number) {
+  return s.length > max ? s.slice(0, max) + "\n\n… _truncated_" : s;
+}
+
+function buildSummaryMarkdown(sol: SolutionsReturn | SolutionsOutput) {
+  const one = sol.summary?.one_liner || "ResolvCI review";
+  const rat = sol.summary?.rationale || "";
+  const conf = typeof sol.summary?.confidence === "number"
+    ? `${Math.round((sol.summary.confidence ?? 0) * 100)}%`
+    : "—";
+  const risk = sol.summary?.risk || "low";
+  return [
+    `**ResolvCI** — ${one}`,
+    ``,
+    rat ? `**Rationale:** ${rat}` : "",
+    `**Confidence:** ${conf} • **Risk:** ${risk}`,
+    ``,
+    `**Legend:** 🔎 diagnostic anchor (source of error) • 💡 inline code suggestion`,
+  ].filter(Boolean).join("\n");
+}
+
+/** Fallback: synthesize review comments from changes using isNoop/appliesCleanly */
+function synthesizeCommentsFromChanges(
+  sol: SolutionsReturn | SolutionsOutput,
+  allowInlineSuggestions: boolean
+) {
+  const changes = Array.isArray(sol.changes) ? sol.changes : [];
+  return changes.slice(0, MAX_REVIEW_COMMENTS).map((chg: any) => {
+    const line = chg?.anchor?.line ?? 1;
+    const lang = chg?.language || null;
+    const code = (chg?.hunk?.after ?? "").toString();
+
+    const isNoop = !!chg?.validation?.isNoop;
+    const clean  = !!chg?.validation?.appliesCleanly;
+
+    // Diagnostic: no actual change; just show the snippet
+    if (isNoop) {
+      const body = [
+        `🔎 **Source of error** — This is a diagnostic anchor (no code change).`,
+        ``,
+        lang ? `\`\`\`${lang}\n${code}\n\`\`\`` : `\`\`\`\n${code}\n\`\`\``,
+      ].join("\n");
+      return { path: chg.path, line, body };
+    }
+
+    // Fix: suggestion block if eligible
+    if (allowInlineSuggestions && clean) {
+      const body = ["💡 **Suggested fix**", "", "```suggestion", code, "```"].join("\n");
+      return { path: chg.path, line, body };
+    }
+
+    // Fix but comment-only (not eligible or not clean)
+    const body = [
+      "💡 **Suggested fix (comment-only; please review)**",
+      "",
+      lang ? `\`\`\`${lang}\n${code}\n\`\`\`` : `\`\`\`\n${code}\n\`\`\``,
+    ].join("\n");
+    return { path: chg.path, line, body };
+  });
+}
+
 /* ============================== Types ============================== */
 
 type StageFromSolutionParams = {
@@ -39,11 +102,29 @@ export async function stageReviewOutboxFromSolution(p: StageFromSolutionParams) 
   const { owner, repo, pull_number, head_sha, installation_id } = p;
   const solution = normalizeSolution(p.solution);
 
+  // Policy guard (eligibility for inline suggestion blocks)
+  const tau = Number(process.env.SOLUTIONS_CONFIDENCE_TAU ?? "0.80");
+  const conf = Number(solution?.summary?.confidence ?? 0);
+  const lowRisk = (solution?.summary?.risk ?? "low") === "low";
+  const validAll = (solution?.changes ?? []).every((c: any) => !!c?.validation?.appliesCleanly);
+  const hasRealFix = (solution?.changes ?? []).some((c: any) => !c?.validation?.isNoop && !!c?.validation?.appliesCleanly);
+  const allowInlineSuggestions = conf >= tau && lowRisk && validAll && hasRealFix;
+
+  // Body: prefer provided, else synthesize
+  const rawBody =
+    solution.summaryMarkdown && solution.summaryMarkdown.trim().length
+      ? solution.summaryMarkdown
+      : buildSummaryMarkdown(solution);
+
+  // Comments: prefer provided, else synthesize from changes w/ diagnostic labeling
+  const rawComments =
+    Array.isArray((solution as any).reviewComments) && (solution as any).reviewComments.length
+      ? (solution as any).reviewComments
+      : synthesizeCommentsFromChanges(solution, allowInlineSuggestions);
+
   // Enforce caps/truncation
-  const comments = (solution.reviewComments || []).slice(0, MAX_REVIEW_COMMENTS);
-  const rawBody = solution.summaryMarkdown || "ResolvCI review";
-  const body =
-    rawBody.length > BODY_MAX_CHARS ? rawBody.slice(0, BODY_MAX_CHARS) + "\n\n… _truncated_" : rawBody;
+  const comments = rawComments.slice(0, MAX_REVIEW_COMMENTS);
+  const body = clampLen(rawBody, BODY_MAX_CHARS);
 
   const payload = {
     type: "pr_review" as const,

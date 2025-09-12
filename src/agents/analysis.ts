@@ -1,4 +1,4 @@
-import { Op, QueryTypes } from "sequelize";
+import { QueryTypes } from "sequelize";
 import { z } from "zod";
 import { ChatOpenAI } from "@langchain/openai";
 import {

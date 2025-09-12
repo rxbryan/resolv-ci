@@ -30,7 +30,11 @@ export type Change = {
   anchor: { line: number } | null;     // ← allow null
   hunk: { after: string };
   language: string | null;             // ← allow null
-  validation: { appliesCleanly: boolean };
+  validation: {
+    appliesCleanly: boolean;
+    isNoop?: boolean;
+  };
+  type?: "fix" | "diagnosis";
 };
 
 export type SolutionsOutput = {
@@ -58,6 +62,14 @@ async function getOcto(owner: string, repo: string, installationId?: number | nu
     return await getOctokitForInstallation(installationId);
   }
   return await getOctokitForRepo(owner, repo);
+}
+
+function normalizeWS(s: string) {
+  return (s ?? "").replace(/\r\n/g, "\n").replace(/[ \t]+/g, " ").trim();
+}
+
+function isNoopChange(original: string, proposed: string) {
+  return normalizeWS(original) === normalizeWS(proposed);
 }
 
 // list_pr_files: enumerate changed files (+ unified diff patches)
@@ -186,13 +198,15 @@ const CodeSearchSchema = z.object({
   max: z.number().int().optional().default(10),
 });
 
-
 const ChangeSchema = z.object({
   path: z.string(),
   anchor: z.object({ line: z.number().int().min(1) }).nullable().default(null),
   hunk: z.object({ after: z.string() }),
   language: z.string().nullable().default(null),
-  validation: z.object({ appliesCleanly: z.boolean() }),
+  validation: z.object({
+    appliesCleanly: z.boolean(),
+    isNoop: z.boolean().optional().default(false),
+  }),
 });
 
 const SolutionsSchema = z.object({
@@ -335,7 +349,12 @@ export async function solveFailure(
       const ms = Date.now() - t0;
   
       // record + log
-      toolInvocations.push({ name: tc.name, args, ms, ok: !result?.error });
+      toolInvocations.push({
+        name: tc.name,
+        args_json: safePreview(args, 2000),  // keep it small; schema wants a string
+        ms,
+        ok: !result?.error,
+      });
       toolCounts[tc.name] = (toolCounts[tc.name] ?? 0) + 1;
       toolTimeMs[tc.name] = (toolTimeMs[tc.name] ?? 0) + ms;
   
@@ -389,9 +408,53 @@ export async function solveFailure(
   const sol = SolutionsSchema.parse(result);
   const confidence = clamp01(sol.summary.confidence ?? 0);
   const lowRisk = sol.summary.risk === "low";
-  const validAll = sol.changes.every((c) => c.validation?.appliesCleanly);
-
-  const autoSuggestionEligible = confidence >= TAU && lowRisk && validAll;
+  
+  /**
+   * Validate each proposed change by fetching a nearby slice and
+   * marking isNoop if the proposed content matches the current content (ignoring whitespace).
+   */
+  const validatedChanges: Change[] = [];
+  for (const ch of sol.changes) {
+    try {
+      const slice = await fetchSliceTool.invoke(
+        {
+          owner: repo_owner,
+          repo: repo_name,
+          ref: commit_sha,
+          path: ch.path,
+          start_line: ch.anchor?.line ? Math.max(1, ch.anchor.line - 5) : 1,
+          end_line: ch.anchor?.line ? ch.anchor.line + 5 : null,
+        } as any,
+        { configurable: { octo } } as any
+      );
+  
+      const current = String((slice as any)?.slice ?? "");
+      const proposed = ch.hunk?.after ?? "";
+      const noop = isNoopChange(current, proposed);
+  
+      // ← derive type here; don't read ch.type
+      const typ: "fix" | "diagnosis" =
+        !noop && ch.validation?.appliesCleanly ? "fix" : "diagnosis";
+  
+      validatedChanges.push({
+        ...ch,
+        validation: { ...ch.validation, isNoop: noop },
+        type: typ,
+      });
+    } catch {
+      validatedChanges.push({
+        ...ch,
+        validation: { ...ch.validation, isNoop: true },
+        type: "diagnosis",
+      });
+    }
+  }
+  
+  
+  // For policy: “real fixes” are clean & non-noop
+  const realFixes = validatedChanges.filter(c => !c.validation.isNoop && c.validation.appliesCleanly);
+  
+  const autoSuggestionEligible = confidence >= TAU && lowRisk && realFixes.length > 0;
   const policy =
     sol.policy?.autoSuggestionEligible !== undefined
       ? sol.policy
@@ -399,27 +462,48 @@ export async function solveFailure(
           autoSuggestionEligible,
           reason: autoSuggestionEligible
             ? "High confidence & low risk with clean patches."
-            : "Either confidence below threshold, medium/high risk, or invalid anchors.",
+            : "Either confidence below threshold, medium/high risk, or only diagnostics present.",
         };
+  
 
-  // Top review body
+  // Top review body (add a small legend for clarity)
   const summaryMarkdown = [
     `**ResolvCI** — ${sol.summary.one_liner}`,
     ``,
     `**Rationale:** ${sol.summary.rationale}`,
     `**Confidence:** ${(confidence * 100).toFixed(0)}% • **Risk:** ${sol.summary.risk}`,
+    ``,
+    `**Legend:** 🔎 diagnostic anchor (source of error) • 💡 inline code suggestion`,
   ].join("\n");
 
-  // Inline review comments (suggestion blocks only if eligible)
-  const reviewComments = sol.changes.map((chg) => {
+  // Inline comments: diagnostics (no-op) vs suggestions (real fixes)
+  const reviewComments = validatedChanges.map((chg) => {
     const line = chg.anchor?.line ?? 1;
-    const bodyParts = [
-      chg.language ? `Language: ${chg.language}` : "",
-      validAll && autoSuggestionEligible
-        ? `\n\`\`\`suggestion\n${chg.hunk.after}\n\`\`\`\n`
-        : `\n**Suggested change:**\n\n\`\`\`\n${chg.hunk.after}\n\`\`\`\n`,
-    ].filter(Boolean);
-    return { path: chg.path, line, body: bodyParts.join("\n") };
+
+    // Diagnostic anchor: no code change, show the helpful snippet
+    if (chg.validation?.isNoop || chg.type === "diagnosis") {
+      const body = [
+        `🔎 **Source of error** — This is a diagnostic anchor (no code change).`,
+        ``,
+        chg.language
+          ? `\`\`\`${chg.language}\n${chg.hunk.after}\n\`\`\``
+          : `\`\`\`\n${chg.hunk.after}\n\`\`\``,
+      ].join("\n");
+      return { path: chg.path, line, body };
+    }
+
+    // Real fix: suggestion block only when eligible; otherwise comment-only hint
+    if (policy.autoSuggestionEligible && chg.validation?.appliesCleanly) {
+      const body = ["💡 **Suggested fix**", "", "```suggestion", chg.hunk.after, "```"].join("\n");
+      return { path: chg.path, line, body };
+    } else {
+      const body = [
+        "💡 **Suggested fix (comment-only; please review)**",
+        "",
+        chg.language ? `\`\`\`${chg.language}\n${chg.hunk.after}\n\`\`\`` : `\`\`\`\n${chg.hunk.after}\n\`\`\``,
+      ].join("\n");
+      return { path: chg.path, line, body };
+    }
   });
 
   const final: SolutionsReturn = {
@@ -428,14 +512,18 @@ export async function solveFailure(
       rationale: sol.summary.rationale,
       risk: sol.summary.risk,
       confidence,
-      references: sol.summary.references, // already defaults to []
+      references: sol.summary.references,
     },
-    changes: sol.changes,
-    tool_invocations: [...sol.tool_invocations, ...toolInvocations],
+    changes: validatedChanges,   // ← use validated+typed changes
+    tool_invocations: [
+      ...sol.tool_invocations,
+      ...toolInvocations,        // already in {name,args_json,ms,ok} shape after Patch 2
+    ],
     policy,
     reviewComments,
     summaryMarkdown,
   };
+  
 
     /* 🔎 summary logs */
   if (DEBUG_SOL) {
