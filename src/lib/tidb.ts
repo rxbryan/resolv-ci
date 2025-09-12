@@ -8,6 +8,9 @@ import 'dotenv/config';
 import mysql2 from 'mysql2';
 
 import { sha1, tailLines, normalize, templateize } from "@/lib/text"; // ← use shared helpers
+
+export type OutboundActionStatus = "staged" | "dispatched" | "error";
+
 // --- singleton for Next.js dev/serverless ---
 const globalForSequelize = global as unknown as { sequelize?: Sequelize };
 export const sequelize =
@@ -224,3 +227,30 @@ export const FixRecommendation =
     { tableName: "fix_recommendations", timestamps: false }
   );
 
+  export const OutboundAction = sequelize.define(
+    "outbound_actions", 
+    {
+      id: { type: DataTypes.BIGINT, autoIncrement: true, primaryKey: true },
+      action_hash: { type: DataTypes.STRING(64), unique: true, allowNull: false },
+      action_type: { type: DataTypes.ENUM("pr_review"), allowNull: false, defaultValue: "pr_review" },
+      head_sha: { type: DataTypes.STRING(64), allowNull: true },
+      installation_id: { type: DataTypes.BIGINT, allowNull: true },
+      payload_json: { type: DataTypes.TEXT("long"), allowNull: false }, // LONGTEXT
+      status: { type: DataTypes.ENUM("staged", "dispatched", "error"), allowNull: false, defaultValue: "staged" },
+      attempt_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+      dispatched_at: { type: DataTypes.DATE, allowNull: true },
+      last_error: { type: DataTypes.TEXT, allowNull: true },
+      created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+    },
+    {
+      tableName: "outbound_actions",
+      timestamps: false,
+      indexes: [
+        { unique: true, fields: ["action_hash"] },
+        { fields: ["status", "id"] },                 // <- composite for faster queue scans
+        { fields: ["head_sha"] },
+        { fields: ["installation_id"] },
+      ],
+    }
+  );
+  

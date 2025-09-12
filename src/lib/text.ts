@@ -51,3 +51,16 @@ export function simFromDistance(distance: number | string | null | undefined) {
   const dc = Math.max(0, Math.min(1, d));
   return 1 - dc;
 }
+
+/** 0..1 clamp */
+export function clamp01(x: number | undefined) {
+  if (typeof x !== "number" || Number.isNaN(x)) return 0;
+  return Math.max(0, Math.min(1, x));
+}
+
+/** Safe stringify with size clamp (avoid giant rows) */
+export function jsonClamp(v: unknown, max = 800_000) {
+  let s = "";
+  try { s = JSON.stringify(v); } catch { s = String(v); }
+  return s.length > max ? s.slice(0, max) + ` /* … truncated ${s.length - max} bytes */` : s;
+}

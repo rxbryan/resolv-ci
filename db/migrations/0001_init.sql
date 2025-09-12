@@ -5,15 +5,21 @@ create table if not exists webhook_events (
   received_at timestamp default current_timestamp
 );
 
-create table if not exists outbound_actions (
-  id bigint primary key auto_increment,
-  action_hash char(64) unique not null,
-  repo_owner varchar(200) not null,
-  repo_name varchar(200) not null,
-  pull_number int not null,
-  head_sha char(40) not null,
-  action_type enum('pr_review') not null,
-  payload_json json not null,
-  dispatched_at timestamp null,
-  github_response_json json null
+
+CREATE TABLE IF NOT EXISTS outbound_actions (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  action_hash VARCHAR(64) NOT NULL,
+  action_type ENUM('pr_review') NOT NULL DEFAULT 'pr_review',
+  head_sha VARCHAR(64) NULL,
+  installation_id BIGINT NULL,
+  payload_json LONGTEXT NOT NULL,
+  status ENUM('staged','dispatched','error') NOT NULL DEFAULT 'staged',
+  attempt_count INT NOT NULL DEFAULT 0,
+  dispatched_at DATETIME NULL,
+  last_error TEXT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY ux_outbound_action_hash (action_hash),
+  KEY ix_status_id (status, id),
+  KEY ix_head_sha (head_sha),
+  KEY ix_installation_id (installation_id)
 );
