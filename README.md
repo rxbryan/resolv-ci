@@ -38,28 +38,28 @@ Built with **TypeScript · Next.js · TiDB Serverless (HTAP + Vectors) · LangGr
 
 ```mermaid
 flowchart TD
-  GI[GitHub App (webhook)]
-  AN[Analysis (LLM + TiDB retrieval)]
-  SO[Solutions (LLM + repo tools)]
-  DEC{Ready? <br/>confidence ≥ τ <br/>or loops ≥ N}
-  AC[Actuator (stage PR review)]
-  MR[(Manual review)]
-  DLQ[(Dead Letter Queue)]
+  GI[GitHub App webhook]
+  AN[Analysis - LLM + TiDB]
+  SO[Solutions - LLM + tools]
+  DEC{"Ready?\nconfidence >= tau\nor loops >= N"}
+  AC[Actuator - PR review]
+  MR[Manual review]
+  DLQ[Dead Letter Queue]
   DONE((Done))
 
   GI --> AN
   AN --> SO
   SO --> DEC
-  DEC -- "No → need more context" --> AN
-  DEC -- "Yes → post review" --> AC
+  DEC -- "No -> need more context" --> AN
+  DEC -- "Yes -> post review" --> AC
 
   AC --> DONE
   AC -->|retryable error| AC
   AC -->|anchor invalid| MR
 
-  GI -. failure .-> DLQ
-  AN -. failure .-> DLQ
-  SO -. failure .-> DLQ
+  GI -.-> DLQ
+  AN -.-> DLQ
+  SO -.-> DLQ
 ```
 
 **Guardrails**
