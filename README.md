@@ -1,82 +1,88 @@
 # ResolvCI
-ResolvCI automatically analyzes build failures of your github action workflow, ingests build failures, analyzes logs, gathers missing context from your repo, and proposes **review-only** fixes directly in the PR.  
-Built with **TypeScript + Next.js + TiDB Serverless + LangGraph**.
+
+ResolvCI automatically analyzes failed GitHub Actions runs for your pull requests, ingests failure logs, searches your repo/history for context, and proposes **review-only** fixes directly on the PR.
+Built with **TypeScript · Next.js · TiDB Serverless (HTAP + Vectors) · LangGraph**.
+
+---
 
 ## ✨ What it does
 
-- **GitHub App as Ingestion Agent (ambient)**  
-  Listens to `check_run` events, verifies signatures, deduplicates deliveries, fetches logs, and upserts failure records in TiDB.
+* **GitHub App (Ingestion Agent)**
+  Verifies HMAC, dedupes deliveries, pulls workflow logs, computes stable **error signatures** and a normalized tail, and upserts a row in TiDB.
 
-- **Analysis Agent (grounded retrieval)**  
-  LLM **structures** the failure window (error class, file hints, keywords), then runs **hybrid retrieval** (BM25 + vector) in TiDB to pull similar failures and known fixes.
+* **Analysis Agent (grounded retrieval)**
+  Uses an LLM to **structure** the failure (error class, hints, keywords), then runs **hybrid retrieval** in TiDB:
 
-- **Solutions Agent (autonomous, read-only tools)**  
-  Reasons over logs + history, **fetches repo files/slices** when confidence is low, synthesizes **minimal** patches, validates them, and outputs a strict JSON contract (summary + changes).
+  * **Exact**: persisted signatures `error_signature_v1/v2`
+  * **Semantic**: auto-embedded vectors on `norm_tail_vec` and past **fix\_recommendations** (Amazon Titan v2 via TiDB Cloud)
 
-- **Actuator Agent (Reviewer)**  
-  Converts patches into **PR Review Suggestions** (GitHub ```suggestion``` blocks) plus a concise **summary** in the review body. Uses an **outbox** for exactly-once posting.
+* **Solutions Agent (autonomous + tools, read-only)**
+  Reasons over logs/history and uses repo tools to get missing context:
 
-- **PR Conversation Awareness**  
-  Reads PR review threads, respects feedback/mentions, can reply in-thread and refine suggestions (still **PR-only**).
+  * `list_pr_files` · `fetch_slice` · `code_search`
+    Validates / dry-runs patches, classifies outputs, and returns a strict JSON contract (summary, changes, policy).
 
-- **Dashboard**  
-  Shows failures, loop iterations, tool calls, suggestions, and MTTR trends.
+* **Actuator Agent (Reviewer, exactly-once)**
+  Converts results into a single **PR Review**:
+
+  * **💡 Suggested fix**: inline `suggestion` blocks (only for valid, low-risk patches)
+  * **🔎 Source of error**: **diagnostic anchors** (no code change) with snippet + permalink
+    Uses an **outbox** table for exactly-once delivery and retries.
+
+* **Non-linear loops (Insight Loop)**
+  Solutions may request more context (fetch slices, search symbols), loop back to Analysis, and continue until **τ** (confidence) or budget limits are met.
 
 ---
 
 ## 🧠 How ResolvCI thinks
 
-### Non-linear “Insight Loop”
-ResolvCI isn’t a one-way pipeline. It loops until it’s confident:
-
 ```mermaid
 flowchart TD
-  GI["GitHub App Ingestion Agent<br/>(Serverless Webhook)"]
-  A["Analysis Agent<br/>(LLM structuring + Hybrid Search)"]
-  S["Solutions Agent<br/>(LLM Reasoning + Tools)"]
-  D{"Decide:<br/>Confidence >= tau"}
-  F[["Repo Tools:<br/>list_pr_files / fetch_slice / code_search"]]
-  AC["Actuator Agent<br/>(PR Review Suggestions)"]
-  MR[(Manual Review)]
+  GI[GitHub App (webhook)]
+  AN[Analysis (LLM + TiDB retrieval)]
+  SO[Solutions (LLM + repo tools)]
+  DEC{Ready? <br/>confidence ≥ τ <br/>or loops ≥ N}
+  AC[Actuator (stage PR review)]
+  MR[(Manual review)]
   DLQ[(Dead Letter Queue)]
   DONE((Done))
 
-  GI --> A
-  A --> S
-  S --> D
-  D -- "Need More Context" --> F
-  F --> A
-  D -- "Ready to Act" --> AC
-  D -- "Give Up / Budget" --> MR
+  GI --> AN
+  AN --> SO
+  SO --> DEC
+  DEC -- "No → need more context" --> AN
+  DEC -- "Yes → post review" --> AC
 
-  AC -->|success| DONE
+  AC --> DONE
   AC -->|retryable error| AC
   AC -->|anchor invalid| MR
 
   GI -. failure .-> DLQ
-  A -. failure .-> DLQ
-  S -. failure .-> DLQ
-  F -. forbidden/oversize .-> MR
-
-````
+  AN -. failure .-> DLQ
+  SO -. failure .-> DLQ
+```
 
 **Guardrails**
 
-* **τ (tau) confidence threshold:** default **0.80**
-* **Budgets:** **≤ 3** tool calls, **≤ 5s** total tool time, **≤ 3** loop iterations
-* **Safety:** Solutions Agent never writes; only Actuator posts **reviews** (no commits)
+* **τ (tau):** default **0.80** confidence
+* **Budgets:** ≤ **3** tool calls · ≤ **5s** total tool time · ≤ **3** loop iterations
+* **Safety:** Solutions never write; **Actuator** posts reviews via an **outbox** (exactly-once)
 
 ---
 
 ## 🧰 Solutions Agent tools
 
-* **`list_pr_files`** – enumerate changed files **plus unified diff patches** (hunk ranges) to anchor suggestions where the developer changed code.
-* **`fetch_file` / `fetch_slice`** – fetch a file (or targeted line range) at the PR **head SHA**; keep payloads small.
-* **`code_search`** – locate symbols or config keys quickly; still fetch slices to **validate**.
+* **`list_pr_files`** – enumerate changed files **with unified diff hunks** to anchor suggestions exactly where the developer edited code.
+* **`fetch_slice` / `fetch_file`** – fetch a precise range at the PR **head SHA**; keep payloads small.
+* **`code_search`** – locate symbols/config keys quickly; always fetch slices to validate before proposing edits.
 
-**Validation:** Patches are **dry-run applied** to fetched content; **YAML/JSON are parsed** to prevent broken suggestions. Invalid hunks **degrade to comment-only** guidance.
+**Validation & Classification**
 
-**Output contract (simplified):**
+* Patches are **dry-run applied** to fetched content; **YAML/JSON parsed** to prevent broken suggestions.
+* If a proposed change equals the current content (ignoring whitespace), it’s labeled **🔎 diagnostic** (no `suggestion` block).
+* Invalid anchors or risky edits degrade to “summary-only” or comment-only hints.
+
+**Output contract (simplified)**
 
 ```ts
 interface SolutionsOutput {
@@ -92,7 +98,8 @@ interface SolutionsOutput {
     anchor?: { line: number };
     hunk: { after: string };
     language?: string;
-    validation: { appliesCleanly: boolean };
+    validation: { appliesCleanly: boolean; isNoop?: boolean };
+    type?: "fix" | "diagnosis";
   }>;
   tool_invocations?: any[];
   policy: { autoSuggestionEligible: boolean; reason: string };
@@ -103,60 +110,80 @@ interface SolutionsOutput {
 
 ## 📝 Actuator Agent (Reviewer)
 
-**Posts one PR review** with:
+Posts **one PR review** containing:
 
-* **Top note (review body):** brief error summary + rationale + **permalinked code links** to PR head, e.g.
-  `https://github.com/<owner>/<repo>/blob/<HEAD_SHA>/<path>#L<start>-L<end>`
-* **Inline comments:** each contains a rationale and a `suggestion` block with the **minimal fix**.
+* **Top note (review body):** brief error summary + rationale + a **legend**
+  *Legend: **🔎 diagnostic anchor** (source of error) • **💡 inline code suggestion***
+* **Inline items:**
 
-**Confidence policy**
-
-* **≥ 0.80** & **low risk** (lint/yaml/json) & **valid patch** → **inline suggestions**
-* **0.60–0.79** or **medium risk** → **summary + comment-only** hints
-* **< 0.60** or **invalid anchors** → **summary-only** + (optionally) a clarifying question
+  * **💡 Suggested fix:** a minimal `suggestion` block (only if low risk, valid patch, confidence ≥ τ)
+  * **🔎 Source of error:** a labeled diagnostic comment with a snippet and a **permalink**
+    `https://github.com/<owner>/<repo>/blob/<HEAD_SHA>/<path>#L<line>`
 
 **Exactly-once outbox**
 
-* All reviews are **staged** in `outbound_actions` with a deterministic **`action_hash`** (payload + head SHA)
-* A **dispatcher** posts once; anchor failures degrade to **summary-only** or fewer suggestions
+* All reviews are **staged** in `outbound_actions` with deterministic `action_hash` (payload + head SHA).
+* `/api/dispatch-outbox` posts staged actions; failures degrade to summary-only or fewer suggestions.
 
 ---
 
-## ⚙️ Tech stack
+## ⚙️ Architecture
 
-* **Language:** TypeScript
-* **Framework:** Next.js (API routes for webhook + React dashboard)
-* **DB:** TiDB Serverless (HTAP + vector search)
-* **ORM:** Sequelize + mysql2
-* **Orchestration:** LangGraph (TypeScript)
-* **LLM:** OpenAI-compatible API (configurable)
-* **GitHub:** GitHub App (Octokit)
+**API routes (Next.js serverless):**
+
+* `POST /api/github-webhook` — verify, dedupe, ingest, download logs (zip), unzip (`yauzl`), compute **signatures** and **norm\_tail**, upsert **build\_failures**, then **fire-and-forget** `/api/graph-run`.
+* `POST /api/graph-run` — claim oldest `status="new"` build failures, backfill logs/tails if needed, run LangGraph loop, **stage** PR review in outbox, then trigger `/api/dispatch-outbox`.
+* `POST /api/dispatch-outbox` — batch-dispatch staged reviews to GitHub (exactly-once), update statuses.
+
 
 ---
 
-## 📂 Project structure
+## 🗄️ TiDB schema (key tables)
 
-```
-app/
-  api/github-webhook/route.ts   # Serverless webhook (verify, dedupe, ingest)
-agents/
-  analysis.ts                    # LLM structuring + hybrid retrieval
-  solutions.ts                   # Reasoning + tools + validation
-  actuator.ts                    # PR reviewer (suggestions + summary)
-components/
-  Dashboard.tsx                  # Failure list, loops, suggestions, MTTR
-lib/
-  tidb.ts                        # Sequelize models, outbox, artifacts
-```
+* **`build_failures`**
+  `installation_id`, `run_id?`, `repo_owner`, `repo_name`, `pr_number?`, `commit_sha`, `log_content?`,
+  **`error_signature_v1`** (sha1 of normalized tail), **`error_signature_v2`** (sha1 of templated normalized tail),
+  **`norm_tail`**, **`norm_tail_vec`** = `EMBED_TEXT('tidbcloud_free/amazon/titan-embed-text-v2', norm_tail)`,
+  vector index created with `ADD_COLUMNAR_REPLICA_ON_DEMAND`.
+
+* **`fix_recommendations`** 
+  JSON blobs + **`summary_one_liner`**, **`rationale`**, generated **`content`** (summary + top hunks),
+  **`content_vector`** = `EMBED_TEXT('...titan-embed-text-v2', content)`, vector index with `ADD_COLUMNAR_REPLICA_ON_DEMAND`.
+  Idempotent on `(failure_id, head_sha)`.
+
+* **`outbound_actions`** (outbox)
+  `action_hash` (unique), `payload_json`, `status` (`staged`|`dispatched`|`error`), `attempt_count`, `dispatched_at`, `last_error`, indices on `(status,id)`.
 
 ---
 
 ## 🔐 Permissions & security
 
-* **GitHub App scopes:** Pull requests: Read/Write (reviews), Contents: Read, Checks: Read
+* **GitHub App scopes:** Pull requests (Read/Write – reviews), Contents (Read), Checks (Read)
 * **Webhook verification:** `X-Hub-Signature-256` HMAC before any DB writes
 * **No secrets in tools:** block `.env*`, keys, and oversized files
 * **Review-only:** No commits; humans apply suggestions
+
+---
+
+## 📦 Project structure
+
+```
+app/
+  api/github-webhook/route.ts   # verify, dedupe, ingest, download logs, upsert failure, trigger graph-run
+  api/graph-run/route.ts        # claim + run LangGraph; stage review; trigger dispatch
+  api/dispatch-outbox/route.ts  # post staged reviews to GitHub (exactly-once)
+agents/
+  analysis.ts                    # LLM structuring + exact/vector neighbors + prior fixes
+  solutions.ts                   # Reasoning + tools (list_pr_files/fetch_slice/code_search) + validation
+  actuator.ts                    # Stage PR review (summary + inline items) into outbox
+  knowledge.ts                   # Persist recommendations (summary_one_liner + rationale for better vectors)
+  graph.ts                       # LangGraph state machine with confidence/budget loop
+lib/
+  tidb.ts                        # Sequelize models, helpers (normalize/templateize), DB utils
+  github.ts                      # Octokit helpers (installation-aware)
+  text.ts                        # sha1, redact/redactSecrets, normalize, templateize, jsonClamp
+  solution-utils.ts              # normalizeSolution (shared formatting/policy)
+```
 
 ---
 
@@ -164,25 +191,32 @@ lib/
 
 ### Prerequisites
 
-* Node.js 20+
-* TiDB Cloud cluster (Serverless)
+* Node.js **20+**
+* TiDB Cloud **Serverless** (Starter)
 * GitHub App (App ID, private key, webhook secret)
 
-### Env vars
+### Environment
 
 ```bash
 # TiDB
-TIDB_HOST=<host>         TIDB_PORT=4000
-TIDB_USER=<user>         TIDB_PASSWORD=<pass>
-TIDB_DATABASE=agentic_ci
+TIDB_HOST=...
+TIDB_PORT=
+TIDB_USER=...
+TIDB_PASSWORD=...
+TIDB_DATABASE=
 
 # GitHub App
-GITHUB_APP_ID=<id>
+GITHUB_APP_ID=...
 GITHUB_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
-GITHUB_WEBHOOK_SECRET=<secret>
+GITHUB_WEBHOOK_SECRET=...
 
 # LLM
-LLM_API_KEY=<key>
+LLM_API_KEY=...               # e.g., OpenAI-compatible
+LLM_MODEL_CHAT=    # OpenAI models
+
+# App
+CRON_SECRET=
+NEXT_PUBLIC_BASE_URL=https://your-deploy-url   #  derived in code for dev
 ```
 
 ### Install & run
@@ -192,34 +226,22 @@ npm install
 npm run dev
 ```
 
-Expose your local webhook via **ngrok** or deploy to **Vercel**.
-
-
-## 📊 Observability
-
-* `agent_runs` — per-node status, loop iteration, last\_error
-* `fetched_artifacts` — cached files/slices with blob SHAs
-* `tool_invocations` — each tool call with inputs/outputs
-* `outbound_actions` — staged reviews/comments with dispatch receipts
+Expose your local webhook with **ngrok** or deploy to **Vercel**.
 
 
 ## ❓ FAQ
 
-**Why no auto-commits?**
-To keep trust high and workflows safe. ResolvCI proposes tiny, validated changes as review suggestions; humans choose to apply.
+**Why diagnostic anchors?**
+Sometimes the best help is to point precisely at the failing spot (logs/config/test) with context—**no edits** required.
 
 **Why hybrid retrieval (not LLM-only)?**
-LLM structures the log; TiDB retrieval **grounds** the diagnosis in prior reality (deterministic, auditable).
+LLM structures the failure; TiDB retrieval **grounds** the diagnosis in prior reality (deterministic, auditable).
 
 **What if anchors fail?**
 We degrade to summary-only or fewer suggestions and re-anchor on the new head SHA.
 
+---
 
 ## 📜 License
 
-MIT.
-
-
-## 🙌 Thanks
-
-PingCAP / TiDB • LangGraph • Next.js • Octokit
+Apache License Version 2.0
