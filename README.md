@@ -7,6 +7,16 @@ Built with **TypeScript · Next.js · TiDB Serverless (HTAP + Vectors) · LangGr
 
 ## ✨ What it does
 
+ResolvCI mirrors the classic control-systems pattern:
+
+* **Sensor/Ingestion** → observes the world (webhook + logs)
+
+* **Controller/Analysis & Solutions** → thinks and decides what should happen
+
+* **Actuator** → performs the side-effect in the world
+
+In our case, “the world” is GitHub.
+
 * **GitHub App (Ingestion Agent)**
   Verifies HMAC, dedupes deliveries, pulls workflow logs, computes stable **error signatures** and a normalized tail, and upserts a row in TiDB.
 
