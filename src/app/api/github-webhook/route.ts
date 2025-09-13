@@ -101,14 +101,16 @@ ${payload.comment?.body ?? ""}`;
       fetch(`${base}/api/graph-run`, {
         method: "POST",
         headers: { Authorization: `Bearer ${secret}` },
-        // @ts-expect-error keepalive ok in Node 18+
         keepalive: true,
       }).catch(() => {});
     }
 
     return NextResponse.json({ ok: true });
-  } catch (err: any) {
+  } catch (err: unknown) {
+    let message: string = String(err)
+    if (err instanceof Error)
+      message = err?.message
     console.error("webhook error:", err);
-    return NextResponse.json({ error: "internal", detail: String(err?.message ?? err) }, { status: 500 });
+    return NextResponse.json({ error: "internal", detail: message }, { status: 500 });
   }
 }

@@ -3,6 +3,7 @@ export const dynamic = "force-dynamic";
 
 import { NextRequest, NextResponse } from "next/server";
 import yauzl from "yauzl";
+import type { BaseMessage } from "@langchain/core/messages";
 import {
   sequelize,
   BuildFailure,
@@ -16,7 +17,7 @@ import {
   findLatestRunForPR,
 } from "@/lib/github";
 
-import { ResolvGraphApp } from "@/agents/graph";
+import { ResolvGraphApp, type GraphInit } from "@/agents/graph";
 
 function authorized(req: NextRequest) {
   return req.headers.get("authorization") === `Bearer ${process.env.CRON_SECRET}`;
@@ -89,40 +90,15 @@ async function unzipLogArchive(
   return combined;
 }
 
-export async function downloadPRLogs(
-  octo: any,
-  owner: string,
-  repo: string,
-  prNumber: number,
-  headSha: string
-): Promise<Buffer> {
-  const run = await findLatestRunForPR(octo, owner, repo, prNumber, headSha);
-  if (!run) throw new Error(`No PR-triggered run found for #${prNumber} @ ${headSha}`);
-
-  const { data } = await octo.rest.actions.downloadWorkflowRunLogs({
-    owner, repo, run_id: run.id,
-  });
-
-  if (Buffer.isBuffer(data)) return data as Buffer;
-  if ((data as any)?.pipe) {
-    const chunks: Buffer[] = [];
-    for await (const chunk of (data as any as NodeJS.ReadableStream)) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    }
-    return Buffer.concat(chunks);
-  }
-  if ((data as any)?.byteLength) return Buffer.from(data as ArrayBuffer);
-  return Buffer.from(String(data ?? ""), "utf8");
-}
-
 
 export async function POST(req: NextRequest) {
-  if (req.headers.get("authorization") !== `Bearer ${process.env.CRON_SECRET}`) {
+  if (!authorized(req)) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
 
   // Claim a row
   const t = await sequelize.transaction();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let f: any | null = null;
   try {
     f = await BuildFailure.findOne({
@@ -178,7 +154,8 @@ export async function POST(req: NextRequest) {
         repo: failure.repo_name,
         run_id: run.id,
       });
-
+      
+      /* eslint-disable @typescript-eslint/no-explicit-any */
       const zipBuf =
         Buffer.isBuffer(data)
           ? (data as Buffer)
@@ -193,6 +170,8 @@ export async function POST(req: NextRequest) {
           : (data as any)?.byteLength
           ? Buffer.from(data as ArrayBuffer)
           : Buffer.from(String(data ?? ""), "utf8");
+      /* eslint-enable @typescript-eslint/no-explicit-any */
+      
 
       const combined = await unzipLogArchive(zipBuf, {
         maxFiles: 40,
@@ -228,8 +207,8 @@ export async function POST(req: NextRequest) {
       failure_id: fresh.failure_id,
       installation_id: fresh.installation_id ?? null,
       insight_loops: 0,
-      messages: [],
-    } as any);
+      messages: [] as BaseMessage[],
+    } as GraphInit);
 
     await f.update({ status: "proposed" });
 
@@ -243,7 +222,6 @@ export async function POST(req: NextRequest) {
       fetch(`${base}/api/dispatch-outbox`, {
         method: "POST",
         headers: { Authorization: `Bearer ${secret}` },
-        // @ts-expect-error keepalive ok
         keepalive: true,
       }).catch(() => {});
     }
@@ -253,11 +231,11 @@ export async function POST(req: NextRequest) {
       failure_id: fresh.failure_id,
       loops: result?.insight_loops ?? 0,
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("graph-run execution error:", err);
     try {
       await f.update({ status: "skipped" });
     } catch {}
-    return NextResponse.json({ ok: false, error: String(err?.message ?? err) }, { status: 500 });
+    return NextResponse.json({ ok: false, error: String(err) }, { status: 500 });
   }
 }

@@ -1,13 +1,29 @@
 import { Annotation, StateGraph, START, END } from "@langchain/langgraph";
 import type { BaseMessage } from "@langchain/core/messages";
 
-import { analyzeFailure } from "@/agents/analysis";
+import { analyzeFailure, AnalysisOutput } from "@/agents/analysis";
 import { solveFailure, type SolutionsOutput } from "@/agents/solutions";
 import { stageReviewOutboxFromSolution } from "@/agents/actuator";
 import { recordSolutionArtifacts } from "@/agents/knowledge";
 
 const TAU = Number(process.env.SOLUTIONS_CONFIDENCE_TAU ?? "0.80");
 const MAX_LOOPS = Number(process.env.SOLUTIONS_MAX_LOOPS ?? "3");
+
+export type GraphInit = {
+  repo_owner: string;
+  repo_name: string;
+  pr_number: number;
+  head_sha: string;
+  log_content: string;
+  failure_id?: number;
+  installation_id?: number | null;
+  insight_loops: number;
+  messages: BaseMessage[];
+  // optional channels:
+  analysis?: AnalysisOutput;
+  solution?: SolutionsOutput;
+  confidence?: number;
+};
 
 /**
  * Graph channels (state schema).
@@ -27,7 +43,7 @@ const GraphState = Annotation.Root({
   installation_id: Annotation<number | null | undefined>(),
 
   messages: Annotation<BaseMessage[]>(),
-  analysis: Annotation<any>(),
+  analysis: Annotation<AnalysisOutput>(),
   solution: Annotation<SolutionsOutput>(),
   confidence: Annotation<number | undefined>(),
   insight_loops: Annotation<number>(),

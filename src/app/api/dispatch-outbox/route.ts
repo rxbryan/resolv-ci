@@ -3,7 +3,7 @@ export const dynamic = "force-dynamic";
 
 import { NextRequest, NextResponse } from "next/server";
 import { OutboundAction } from "@/lib/tidb";
-import { dispatchOneOutboundAction } from "@/agents/actuator";
+import { dispatchOneOutboundAction, OutboundRow } from "@/agents/actuator";
 
 const DEBUG = process.env.DEBUG_DISPATCH === "1";
 const DEFAULT_BATCH = Number(process.env.DISPATCH_BATCH_SIZE ?? "5");
@@ -49,14 +49,15 @@ export async function POST(req: NextRequest) {
     }
 
     if (DEBUG) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       console.log("[Dispatch] picked", rows.length, "staged actions (ids):", rows.map((r: any) => r.id));
     }
-
+    /* eslint-disable @typescript-eslint/no-explicit-any */
     const results = [];
     for (const row of rows) {
       try {
         // Pass a plain object to the dispatcher; it updates status in DB
-        const r = await dispatchOneOutboundAction(row.toJSON() as any);
+        const r = await dispatchOneOutboundAction(row.toJSON() as OutboundRow);
         results.push({ id: (row as any).id, ok: !!r.ok, error: (r as any)?.error });
       } catch (err: any) {
         const msg = String(err?.message ?? err);
@@ -77,7 +78,7 @@ export async function POST(req: NextRequest) {
         results.push({ id: (row as any).id, ok: false, error: msg });
       }
     }
-
+    /* eslint-enable @typescript-eslint/no-explicit-any */
     const okCount = results.filter((r) => r.ok).length;
     if (DEBUG) console.log("[Dispatch] results:", results);
 
@@ -87,10 +88,13 @@ export async function POST(req: NextRequest) {
       attempted: results.length,
       results,
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
+    let message: string = String(err)
+    if (err instanceof Error)
+      message = err?.message
     console.error("[Dispatch] fatal:", err);
     return NextResponse.json(
-      { ok: false, error: String(err?.message ?? err) },
+      { ok: false, error: message },
       { status: 500 }
     );
   }

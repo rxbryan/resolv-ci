@@ -39,7 +39,8 @@ export const sequelize =
   );
 if (!globalForSequelize.sequelize) globalForSequelize.sequelize = sequelize;
 
-
+/* eslint-disable @typescript-eslint/no-explicit-any */
+// review this after the hackathon
 function isTransient(e: any) {
   const code = e?.parent?.code || e?.code || "";
   return (
@@ -49,6 +50,37 @@ function isTransient(e: any) {
   );
 }
 
+export type BuildFailureStatus =
+  | "new"
+  | "analyzing"
+  | "proposed"
+  | "applied"
+  | "skipped";
+
+export interface BuildFailureRow {
+  failure_id: number;
+  run_id: string | null;
+
+  repo_owner: string;
+  repo_name: string;
+  pr_number: number | null;
+
+  commit_sha: string;
+  log_content: string | null;
+
+  installation_id: number | null;
+
+  // persisted signatures + normalized tail
+  error_signature_v1: string | null; // sha1(normalize(tail))
+  error_signature_v2: string | null; // sha1(templateize(normalize(tail)))
+  norm_tail: string | null;
+
+  // generated vector (usually not selected; keep optional)
+  norm_tail_vec?: number[] | null;
+
+  status: BuildFailureStatus;
+  failure_timestamp: Date | string; // TiDB DATETIME -> Date (node) or string (raw)
+}
 
 /**
  * Switch just WebhookEvent and buildfailure to sequelize.define(...) (no classes), keep classes for the other models.

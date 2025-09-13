@@ -1,4 +1,5 @@
 import { App } from "octokit";
+import type { Octokit } from "octokit";
 
 function normalizeKey(k?: string) {
   // Vercel/ENV usually stores \n; GitHub expects real newlines
@@ -50,7 +51,7 @@ export async function getOctokitForContext(
 
 // Find the newest workflow run for the specific PR + head_sha
 export async function findLatestRunForPR(
-  octo: any,
+  octo: Octokit,
   owner: string,
   repo: string,
   prNumber: number,
@@ -61,6 +62,7 @@ export async function findLatestRunForPR(
     "pull_request_target",
   ];
 
+  /* eslint-disable @typescript-eslint/no-explicit-any */
   const candidates: any[] = [];
 
   for (const ev of events) {
@@ -83,7 +85,7 @@ export async function findLatestRunForPR(
     Date.parse(b.run_started_at ?? b.created_at) -
     Date.parse(a.run_started_at ?? a.created_at)
   );
-
+  /* eslint-enable @typescript-eslint/no-explicit-any */
   return candidates[0]; // undefined if none
 }
 

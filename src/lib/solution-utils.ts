@@ -5,7 +5,7 @@ const clamp01 = (x?: number) => (typeof x === "number" && !Number.isNaN(x) ? Mat
 
 /** Coerce SolutionsOutput | SolutionsReturn into a full SolutionsReturn */
 export function normalizeSolution(sol: SolutionsOutput | SolutionsReturn): SolutionsReturn {
-  const anySol = sol as any;
+  const anySol = sol as SolutionsReturn;
   const hasExtras = Array.isArray(anySol.reviewComments) && typeof anySol.summaryMarkdown === "string";
 
   const confidence = clamp01(sol.summary.confidence);

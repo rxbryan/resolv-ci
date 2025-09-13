@@ -14,6 +14,8 @@ import {
   getOctokitForRepo,
 } from "@/lib/github";
 import { tailLines } from "@/lib/text";
+import {ToolInvocation} from "@/types/fix_recommendation_list"
+import { AnalysisOutput } from "./analysis";
 
 /* ============================== Config ============================== */
 
@@ -43,10 +45,10 @@ export type SolutionsOutput = {
     rationale: string;
     risk: "low" | "medium" | "high";
     confidence: number;
-    references: any[];                 // required with default []
+    references: string[];                 // required with default []
   };
   changes: Change[];                   // ← uses the nullable fields
-  tool_invocations: any[];             // required with default []
+  tool_invocations: ToolInvocation[];             // required with default []
   policy: { autoSuggestionEligible: boolean; reason: string };
 };
 
@@ -54,125 +56,6 @@ export type SolutionsReturn = SolutionsOutput & {
   reviewComments: Array<{ path: string; line: number; body: string }>;
   summaryMarkdown: string;
 };
-
-/* ============================ Tool helpers ============================ */
-
-async function getOcto(owner: string, repo: string, installationId?: number | null): Promise<Octokit> {
-  if (installationId != null) {
-    return await getOctokitForInstallation(installationId);
-  }
-  return await getOctokitForRepo(owner, repo);
-}
-
-function normalizeWS(s: string) {
-  return (s ?? "").replace(/\r\n/g, "\n").replace(/[ \t]+/g, " ").trim();
-}
-
-function isNoopChange(original: string, proposed: string) {
-  return normalizeWS(original) === normalizeWS(proposed);
-}
-
-// list_pr_files: enumerate changed files (+ unified diff patches)
-const listPRFilesTool = tool(
-  async (
-    input: z.infer<typeof ListPRFilesSchema>,
-    config
-  ) => {
-    const octo: Octokit = (config?.configurable as any)?.octo;
-    const { owner, repo, pull_number, max_files } = input;
-    const { data } = await octo.rest.pulls.listFiles({
-      owner,
-      repo,
-      pull_number,
-      per_page: Math.min(max_files ?? 100, 300),
-    });
-    // Keep small payload: path + patch (unified diff) + stats
-    return data.map((f) => ({
-      filename: f.filename,
-      status: f.status,
-      additions: f.additions,
-      deletions: f.deletions,
-      changes: f.changes,
-      patch: f.patch ?? null, // may be null for large files
-    }));
-  },
-  {
-    name: "list_pr_files",
-    description:
-      "List files changed in a pull request with unified diff patches to anchor suggestions.",
-    schema: z.object({
-      owner: z.string(),
-      repo: z.string(),
-      pull_number: z.number().int(),
-      max_files: z.number().int().optional().default(100),
-    }),
-  }
-);
-
-// fetch_slice: retrieve a file (or targeted range) at PR HEAD SHA
-const fetchSliceTool = tool(
-  async (
-    input: z.infer<typeof FetchSliceSchema>,
-    config
-  ) => {
-    const octo: Octokit = (config?.configurable as any)?.octo;
-    const { owner, repo, ref, path, start_line, end_line } = input;
-    const res = await octo.rest.repos.getContent({ owner, repo, path, ref });
-    if (!("content" in res.data)) {
-      return { path, slice: "", note: "Not a file content response." };
-    }
-    const content = Buffer.from((res.data as any).content, "base64").toString("utf8");
-    const lines = content.split("\n");
-    const s = Math.max(1, start_line);
-    const e = Math.min(lines.length, end_line ?? start_line + 80);
-    const slice = lines.slice(s - 1, e).join("\n");
-    return { path, start_line: s, end_line: e, slice };
-  },
-  {
-    name: "fetch_slice",
-    description:
-      "Fetch a specific line range from a file at a given ref (HEAD SHA). Keep payloads small.",
-    schema: z.object({
-      owner: z.string(),
-      repo: z.string(),
-      ref: z.string(), // HEAD SHA
-      path: z.string(),
-      start_line: z.number().int().min(1),
-      end_line: z.number().int().nullable().default(null),
-    }),
-  }
-);
-
-// code_search: locate symbols/configs quickly (use slices to validate)
-const codeSearchTool = tool(
-  async (
-    input: z.infer<typeof CodeSearchSchema>,
-    config
-  ) => {
-    const octo: Octokit = (config?.configurable as any)?.octo;
-    const { owner, repo } = input;
-    const q = `${input.q} repo:${owner}/${repo}`;
-    const { data } = await octo.rest.search.code({ q, per_page: Math.min(input.max ?? 10, 50) });
-    return (data.items || []).map((it: any) => ({
-      path: it.path,
-      sha: it.sha,
-      score: it.score,
-      url: it.html_url,
-    }));
-  },
-  {
-    name: "code_search",
-    description:
-      "GitHub code search within the repo (symbols, keys, workflows). Use fetch_slice afterwards for validation.",
-    schema: z.object({
-      owner: z.string(),
-      repo: z.string(),
-      q: z.string(), // GitHub search syntax
-      max: z.number().int().optional().default(10),
-    }),
-  }
-);
-
 /* ============================= Zod schemas ============================= */
 
 const ListPRFilesSchema = z.object({
@@ -232,6 +115,119 @@ const SolutionsSchema = z.object({
     reason: z.string(),
   }),
 });
+
+/* ============================ Tool helpers ============================ */
+
+async function getOcto(owner: string, repo: string, installationId?: number | null): Promise<Octokit> {
+  if (installationId != null) {
+    return await getOctokitForInstallation(installationId);
+  }
+  return await getOctokitForRepo(owner, repo);
+}
+
+function normalizeWS(s: string) {
+  return (s ?? "").replace(/\r\n/g, "\n").replace(/[ \t]+/g, " ").trim();
+}
+
+function isNoopChange(original: string, proposed: string) {
+  return normalizeWS(original) === normalizeWS(proposed);
+}
+
+// list_pr_files: enumerate changed files (+ unified diff patches)
+const listPRFilesTool = tool(
+  async (
+    input: z.infer<typeof ListPRFilesSchema>,
+    config
+  ) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const octo: Octokit = (config?.configurable as any)?.octo;
+    const { owner, repo, pull_number, max_files } = input;
+    const { data } = await octo.rest.pulls.listFiles({
+      owner,
+      repo,
+      pull_number,
+      per_page: Math.min(max_files ?? 100, 300),
+    });
+    // Keep small payload: path + patch (unified diff) + stats
+    return data.map((f) => ({
+      filename: f.filename,
+      status: f.status,
+      additions: f.additions,
+      deletions: f.deletions,
+      changes: f.changes,
+      patch: f.patch ?? null, // may be null for large files
+    }));
+  },
+  {
+    name: "list_pr_files",
+    description:
+      "List files changed in a pull request with unified diff patches to anchor suggestions.",
+    schema: ListPRFilesSchema,
+  }
+);
+
+// fetch_slice: retrieve a file (or targeted range) at PR HEAD SHA
+const fetchSliceTool = tool(
+  async (
+    input: z.infer<typeof FetchSliceSchema>,
+    config
+  ) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const octo: Octokit = (config?.configurable as any)?.octo;
+    const { owner, repo, ref, path, start_line, end_line } = input;
+    const res = await octo.rest.repos.getContent({ owner, repo, path, ref });
+    if (!("content" in res.data)) {
+      return { path, slice: "", note: "Not a file content response." };
+    }
+    const content = Buffer.from((res.data as {content: string}).content, "base64").toString("utf8");
+    const lines = content.split("\n");
+    const s = Math.max(1, start_line);
+    const e = Math.min(lines.length, end_line ?? start_line + 80);
+    const slice = lines.slice(s - 1, e).join("\n");
+    return { path, start_line: s, end_line: e, slice };
+  },
+  {
+    name: "fetch_slice",
+    description:
+      "Fetch a specific line range from a file at a given ref (HEAD SHA). Keep payloads small.",
+    schema: FetchSliceSchema,
+  }
+);
+
+// code_search: locate symbols/configs quickly (use slices to validate)
+const codeSearchTool = tool(
+  async (
+    input: z.infer<typeof CodeSearchSchema>,
+    config
+  ) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const octo: Octokit = (config?.configurable as any)?.octo;
+    const { owner, repo } = input;
+    const q = `${input.q} repo:${owner}/${repo}`;
+    const { data } = await octo.rest.search.code({ q, per_page: Math.min(input.max ?? 10, 50) });
+    return (data.items || []).map((it: {
+      name: string;
+      path: string;
+      sha: string;
+      url: string;
+      git_url: string;
+      html_url: string;
+      score: number;
+    }) => ({
+      path: it.path,
+      sha: it.sha,
+      score: it.score,
+      url: it.html_url,
+    }));
+  },
+  {
+    name: "code_search",
+    description:
+      "GitHub code search within the repo (symbols, keys, workflows). Use fetch_slice afterwards for validation.",
+    schema: CodeSearchSchema,
+  }
+);
+
 /* ============================= Main solver ============================= */
 
 export async function solveFailure(
@@ -243,14 +239,7 @@ export async function solveFailure(
     log_content: string;
     installation_id?: number | null;
   },
-  analysis?: {
-    window?: string;
-    structured?: any;
-    similar_failures?: any[];
-    similar_by_tail?: any[];
-    similar_solutions?: any[];
-    messages?: BaseMessage[];
-  }
+  analysis?: AnalysisOutput
 ): Promise<SolutionsReturn> {
   const { repo_owner, repo_name, pr_number, commit_sha, installation_id } = input;
 
@@ -293,9 +282,9 @@ export async function solveFailure(
     ].join("\n")
   );
 
-  let messages: BaseMessage[] = [sys, user];
+  const messages: BaseMessage[] = [sys, user];
   
-  const toolInvocations: any[] = [];
+  const toolInvocations: ToolInvocation[] = [];
   const toolCounts: Record<string, number> = {};
   const toolTimeMs: Record<string, number> = {};
 
@@ -315,6 +304,7 @@ export async function solveFailure(
       break;
     }
   
+    /* eslint-disable @typescript-eslint/no-explicit-any */
     // Execute each requested tool
     for (const tc of calls) {
       const args = typeof tc.args === "string" ? safeParseJson(tc.args) : (tc.args ?? {});
@@ -379,6 +369,7 @@ export async function solveFailure(
       toolCalls++;
       if (toolCalls >= MAX_TOOL_CALLS || Date.now() - started >= MAX_TOOL_MS) break;
     }
+    /* eslint-enable @typescript-eslint/no-explicit-any */
   
     // loop continues: the model will see the tool results we just appended
   }
@@ -416,6 +407,7 @@ export async function solveFailure(
   const validatedChanges: Change[] = [];
   for (const ch of sol.changes) {
     try {
+      /* eslint-disable @typescript-eslint/no-explicit-any */
       const slice = await fetchSliceTool.invoke(
         {
           owner: repo_owner,
@@ -424,11 +416,11 @@ export async function solveFailure(
           path: ch.path,
           start_line: ch.anchor?.line ? Math.max(1, ch.anchor.line - 5) : 1,
           end_line: ch.anchor?.line ? ch.anchor.line + 5 : null,
-        } as any,
+        } as z.infer<typeof FetchSliceSchema>,
         { configurable: { octo } } as any
       );
-  
       const current = String((slice as any)?.slice ?? "");
+      /* eslint-enable @typescript-eslint/no-explicit-any */
       const proposed = ch.hunk?.after ?? "";
       const noop = isNoopChange(current, proposed);
   
@@ -563,7 +555,7 @@ function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
 }
 
-function safePreview(v: any, max = 2000) {
+function safePreview(v: unknown, max = 2000) {
   let s: string;
   try { s = typeof v === "string" ? v : JSON.stringify(v, null, 2); }
   catch { s = String(v); }

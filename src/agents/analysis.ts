@@ -1,14 +1,13 @@
-import { QueryTypes } from "sequelize";
+import { Model, QueryTypes } from "sequelize";
 import { z } from "zod";
 import { ChatOpenAI } from "@langchain/openai";
 import {
   BaseMessage,
   SystemMessage,
   HumanMessage,
-  AIMessage,
 } from "@langchain/core/messages";
 
-import { sequelize, BuildFailure } from "@/lib/tidb";
+import { sequelize, BuildFailure, BuildFailureRow } from "@/lib/tidb";
 import { sha1, normalize, redactSecrets, templateize } from "@/lib/text";
 /* ====================== Config & small helpers ====================== */
 
@@ -81,13 +80,10 @@ export type AnalysisOutput = {
 
 function logAnalysisDebug(
   failureId: number | null | undefined,
-  out: {
-    window: string;
-    structured: any;
-    similar_failures: any[];
-    similar_by_tail: any[];
-    similar_solutions: any[];
-  }
+  out: Pick<
+  AnalysisOutput,
+  "window" | "structured" | "similar_failures" | "similar_by_tail" | "similar_solutions"
+>
 ) {
   const safeTail = out.window.split("\n").slice(-120).join("\n"); // cap to last 120 lines
   const summary = {
@@ -132,7 +128,7 @@ export async function analyzeFailure(f: {
 
   if (f.failure_id) {
     const row = await BuildFailure.findByPk(f.failure_id);
-    const j = row?.toJSON() as any;
+    const j = row?.toJSON() as BuildFailureRow;
     sigV1 = j?.error_signature_v1 ?? null;
     sigV2 = j?.error_signature_v2 ?? null;
     normTail = j?.norm_tail ?? null;
@@ -212,7 +208,7 @@ export async function analyzeFailure(f: {
   });
 
   const similar_failures = [
-    ...exactV1.map((r: any) => {
+    ...exactV1.map((r: Model) => {
       const j = r.toJSON();
       return {
         failure_id: j.failure_id,
@@ -224,7 +220,7 @@ export async function analyzeFailure(f: {
         match_on: "v1" as const,
       };
     }),
-    ...exactV2.map((r: any) => {
+    ...exactV2.map((r: Model) => {
       const j = r.toJSON();
       return {
         failure_id: j.failure_id,
@@ -347,12 +343,17 @@ export async function analyzeFailure(f: {
     similar_solutions = [];
   }
 
-  // We keep analysis stateless for loops to avoid message bloat.
+  /**
+   *Analysis node returns messages: [] (to keep the graph stateless and avoid token bloat)
+   * We keep analysis stateless for loops to avoid message bloat.
   const messages: BaseMessage[] = [
     sys,
     user,
     new AIMessage(JSON.stringify(structured)),
   ];
+
+   * 
+   */
 
   if (process.env.DEBUG_ANALYSIS === "1") {
     logAnalysisDebug(f.failure_id, {

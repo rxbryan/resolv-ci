@@ -1,7 +1,7 @@
 import type { Octokit } from "octokit";
 import { getOctokitForInstallation, getOctokitForRepo } from "@/lib/github";
 import { sequelize, OutboundAction } from "@/lib/tidb";
-import type { SolutionsReturn, SolutionsOutput } from "@/agents/solutions";
+import type { SolutionsReturn, SolutionsOutput, Change } from "@/agents/solutions";
 import { sha1 } from "@/lib/text";
 import { normalizeSolution } from "@/lib/solution-utils";
 
@@ -35,10 +35,13 @@ function buildSummaryMarkdown(sol: SolutionsReturn | SolutionsOutput) {
 /** Fallback: synthesize review comments from changes using isNoop/appliesCleanly */
 function synthesizeCommentsFromChanges(
   sol: SolutionsReturn | SolutionsOutput,
-  allowInlineSuggestions: boolean
+  allowInlineSuggestions: boolean,
+  owner: string,
+  repo: string,
+  headSha: string
 ) {
   const changes = Array.isArray(sol.changes) ? sol.changes : [];
-  return changes.slice(0, MAX_REVIEW_COMMENTS).map((chg: any) => {
+  return changes.slice(0, MAX_REVIEW_COMMENTS).map((chg: Change) => {
     const line = chg?.anchor?.line ?? 1;
     const lang = chg?.language || null;
     const code = (chg?.hunk?.after ?? "").toString();
@@ -46,31 +49,58 @@ function synthesizeCommentsFromChanges(
     const isNoop = !!chg?.validation?.isNoop;
     const clean  = !!chg?.validation?.appliesCleanly;
 
-    // Diagnostic: no actual change; just show the snippet
+    const link = makePermalink(owner, repo, headSha, chg.path, line);
+
     if (isNoop) {
       const body = [
         `🔎 **Source of error** — This is a diagnostic anchor (no code change).`,
         ``,
         lang ? `\`\`\`${lang}\n${code}\n\`\`\`` : `\`\`\`\n${code}\n\`\`\``,
+        ``,
+        `[🔗 Permalink](${link})`
       ].join("\n");
       return { path: chg.path, line, body };
     }
 
-    // Fix: suggestion block if eligible
     if (allowInlineSuggestions && clean) {
-      const body = ["💡 **Suggested fix**", "", "```suggestion", code, "```"].join("\n");
+      const body = [
+        `💡 **Suggested fix**`,
+        ``,
+        "```suggestion",
+        code,
+        "```",
+        ``,
+        `[🔗 Permalink](${link})`
+      ].join("\n");
       return { path: chg.path, line, body };
     }
 
-    // Fix but comment-only (not eligible or not clean)
     const body = [
       "💡 **Suggested fix (comment-only; please review)**",
       "",
       lang ? `\`\`\`${lang}\n${code}\n\`\`\`` : `\`\`\`\n${code}\n\`\`\``,
+      ``,
+      `[🔗 Permalink](${link})`
     ].join("\n");
     return { path: chg.path, line, body };
   });
 }
+
+
+function makePermalink(
+  owner: string,
+  repo: string,
+  sha: string,
+  path: string,
+  startLine: number,
+  endLine?: number
+) {
+  const base = `https://github.com/${owner}/${repo}/blob/${sha}/${encodeURI(path)}`;
+  const anchor =
+    endLine && endLine !== startLine ? `#L${startLine}-L${endLine}` : `#L${startLine}`;
+  return `${base}${anchor}`;
+}
+
 
 /* ============================== Types ============================== */
 
@@ -83,7 +113,7 @@ type StageFromSolutionParams = {
   installation_id?: number | null;
 };
 
-type OutboundRow = {
+export type OutboundRow = {
   id: number;
   action_hash: string;
   action_type: string;
@@ -94,6 +124,15 @@ type OutboundRow = {
   attempt_count?: number;
 };
 
+type GitHubComment = {
+  path: string;
+  position?: number;
+  body: string;
+  line?: number;
+  side?: string;
+  start_line?: number;
+  start_side?: string;
+}
 
 /* ============================ Staging API ============================ */
 
@@ -106,8 +145,8 @@ export async function stageReviewOutboxFromSolution(p: StageFromSolutionParams) 
   const tau = Number(process.env.SOLUTIONS_CONFIDENCE_TAU ?? "0.80");
   const conf = Number(solution?.summary?.confidence ?? 0);
   const lowRisk = (solution?.summary?.risk ?? "low") === "low";
-  const validAll = (solution?.changes ?? []).every((c: any) => !!c?.validation?.appliesCleanly);
-  const hasRealFix = (solution?.changes ?? []).some((c: any) => !c?.validation?.isNoop && !!c?.validation?.appliesCleanly);
+  const validAll = (solution?.changes ?? []).every((c: Change) => !!c?.validation?.appliesCleanly);
+  const hasRealFix = (solution?.changes ?? []).some((c: Change) => !c?.validation?.isNoop && !!c?.validation?.appliesCleanly);
   const allowInlineSuggestions = conf >= tau && lowRisk && validAll && hasRealFix;
 
   // Body: prefer provided, else synthesize
@@ -118,12 +157,23 @@ export async function stageReviewOutboxFromSolution(p: StageFromSolutionParams) 
 
   // Comments: prefer provided, else synthesize from changes w/ diagnostic labeling
   const rawComments =
-    Array.isArray((solution as any).reviewComments) && (solution as any).reviewComments.length
-      ? (solution as any).reviewComments
-      : synthesizeCommentsFromChanges(solution, allowInlineSuggestions);
+  Array.isArray((solution as SolutionsReturn).reviewComments) && (solution as SolutionsReturn).reviewComments.length
+    ? (solution as SolutionsReturn).reviewComments
+    : synthesizeCommentsFromChanges(solution, allowInlineSuggestions, owner, repo, head_sha);
 
-  // Enforce caps/truncation
-  const comments = rawComments.slice(0, MAX_REVIEW_COMMENTS);
+
+  /**
+   * Enforce caps/truncation
+   * Ensure we have permalinks (even when reviewComments came from Solutions)
+   */
+  const ensurePermalink = (c: { path: string; line: number; body: string }) => {
+    if (/github\.com\/.+\/blob\/.+#L\d+/.test(c.body)) return c; // already has one
+    const link = makePermalink(owner, repo, head_sha, c.path, c.line);
+    return { ...c, body: `${c.body}\n\n[🔗 Permalink](${link})` };
+  };
+  
+  const comments = rawComments.slice(0, MAX_REVIEW_COMMENTS).map(ensurePermalink);
+  
   const body = clampLen(rawBody, BODY_MAX_CHARS);
 
   const payload = {
@@ -171,7 +221,7 @@ export async function stageReviewOutboxFromSolution(p: StageFromSolutionParams) 
         payload_json: JSON.stringify(payload),
         status: "staged",
         attempt_count: 0,
-      } as any);
+      });
     } else {
       const q = `
         INSERT INTO outbound_actions
@@ -192,15 +242,17 @@ export async function stageReviewOutboxFromSolution(p: StageFromSolutionParams) 
 
     if (DEBUG) console.log("[Actuator] staged OK:", action_hash);
     return { ok: true as const, action_hash };
-  } catch (e: any) {
+  } catch (e: unknown) {
     // Unique → already staged → treat as success
-    const name = String(e?.name ?? "");
-    if (name.includes("UniqueConstraint") || /duplicate/i.test(String(e?.message ?? ""))) {
-      if (DEBUG) console.log("[Actuator] already staged:", action_hash);
-      return { ok: true as const, action_hash, already: true };
+    if (e instanceof Error) {  
+      const name = String(e?.name ?? "");
+      if (name.includes("UniqueConstraint") || /duplicate/i.test(String(e?.message ?? ""))) {
+        if (DEBUG) console.log("[Actuator] already staged:", action_hash);
+        return { ok: true as const, action_hash, already: true };
+      }
     }
     console.error("[Actuator] stage error:", e);
-    return { ok: false as const, error: String(e?.message ?? e) };
+    return { ok: false as const, error: String(e) };
   }
 }
 
@@ -279,7 +331,7 @@ export async function dispatchOneOutboundAction(a: OutboundRow) {
       pull_number: payload.pull_number,
       event: payload.event || "COMMENT",
       body: payload.body,
-      comments: (payload.comments || []).map((c: any) => ({
+      comments: (payload.comments || []).map((c: GitHubComment) => ({
         path: c.path,
         line: c.line,
         side: c.side || "RIGHT",
@@ -290,23 +342,25 @@ export async function dispatchOneOutboundAction(a: OutboundRow) {
     if (OutboundAction) {
       await OutboundAction.update(
         { status: "dispatched", dispatched_at: new Date(), last_error: null },
-        { where: { id: (a as any).id } }
+        { where: { id: (a as OutboundRow).id } }
       );
     } else {
       await sequelize.query(
         `UPDATE outbound_actions
            SET status='dispatched', dispatched_at=NOW(), last_error=NULL
          WHERE id = :id`,
-        { replacements: { id: (a as any).id } }
+        { replacements: { id: (a as OutboundRow).id } }
       );
     }
 
     if (DEBUG) console.log("[Actuator] dispatched OK:", a.id);
-    return { ok: true, id: (a as any).id };
-  } catch (err: any) {
-    const message = String(err?.message ?? err);
+    return { ok: true, id: (a as OutboundRow).id };
+  } catch (err: unknown) {
+    let message: string = String(err)
+    if (err instanceof Error) {
+      message = String(err?.message ?? err);
+    }
     console.error("[Actuator] dispatch error:", message);
-
     if (OutboundAction) {
       await OutboundAction.update(
         {
@@ -314,7 +368,7 @@ export async function dispatchOneOutboundAction(a: OutboundRow) {
           attempt_count: (a.attempt_count ?? 0) + 1,
           last_error: message.slice(0, 1000),
         },
-        { where: { id: (a as any).id } }
+        { where: { id: (a as OutboundRow).id } }
       );
     } else {
       await sequelize.query(
@@ -323,7 +377,7 @@ export async function dispatchOneOutboundAction(a: OutboundRow) {
                attempt_count=COALESCE(attempt_count,0)+1,
                last_error=:err
          WHERE id = :id`,
-        { replacements: { id: (a as any).id, err: message.slice(0, 1000) } }
+        { replacements: { id: (a as OutboundRow).id, err: message.slice(0, 1000) } }
       );
     }
 

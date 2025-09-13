@@ -3,6 +3,14 @@ import type { SolutionsReturn, SolutionsOutput } from "@/agents/solutions";
 import { jsonClamp } from "@/lib/text";
 import { normalizeSolution } from "@/lib/solution-utils";
 
+import {
+  FixChangesJson,
+  FixRecommendationListItem,
+  parseJson,
+  ToolInvocation,
+  FixRecommendationListRowRaw
+} from "@/types/fix_recommendation_list";
+
 
 const DEBUG = process.env.DEBUG_KNOWLEDGE === "1";
 
@@ -106,10 +114,14 @@ export async function recordSolutionArtifacts(p: PersistParams) {
       });
     }
     return { ok: true as const };
-  } catch (e: any) {
+  } catch (e: unknown) {
+    let message: string = String(e)
+    if (e instanceof Error)
+      message=e?.message
+
     await t.rollback();
     console.error("[Knowledge] persist error:", e);
-    return { ok: false as const, error: String(e?.message ?? e) };
+    return { ok: false as const, error: message };
   }
 }
 
@@ -135,14 +147,23 @@ export async function getRecentRecommendations(opts: {
     replacements: { repo_owner, repo_name, limit },
   });
 
-  // Parse JSON fields
-  return (rows as any[]).map((r) => ({
-    ...r,
-    summary: safeParse(r.summary_json),
-    changes: safeParse(r.changes_json),
-    policy: safeParse(r.policy_json),
-    tool_invocations: safeParse(r.tool_inv_json),
+  const items: FixRecommendationListItem[] = (rows as FixRecommendationListRowRaw[])
+  .map((r): FixRecommendationListItem => ({
+    id: r.id,
+    failure_id: r.failure_id,
+    pr_number: r.pr_number,
+    head_sha: r.head_sha,
+    created_at: r.created_at,
+    summary: parseJson<FixRecommendationListItem["summary"]>(r.summary_json),
+    changes: parseJson<FixChangesJson>(r.changes_json),
+    policy: parseJson<FixRecommendationListItem["policy"]>(r.policy_json),
+    tool_invocations: parseJson<ToolInvocation[]>(r.tool_inv_json),
+    summary_md: r.summary_md,
+    summary_one_liner: r.summary_one_liner,
+    rationale: r.rationale,
   }));
+
+  return items;
 }
 
 /**
@@ -185,13 +206,23 @@ export async function searchRecommendationsSemantic(opts: {
       : { q: query, limit },
   });
 
-  return (rows as any[]).map((r) => ({
-    ...r,
-    summary: safeParse(r.summary_json),
-    changes: safeParse(r.changes_json),
-    policy: safeParse(r.policy_json),
-    tool_invocations: safeParse(r.tool_inv_json),
+  const items: FixRecommendationListItem[] = (rows as FixRecommendationListRowRaw[])
+  .map((r): FixRecommendationListItem => ({
+    id: r.id,
+    failure_id: r.failure_id,
+    pr_number: r.pr_number,
+    head_sha: r.head_sha,
+    created_at: r.created_at,
+    summary: parseJson<FixRecommendationListItem["summary"]>(r.summary_json),
+    changes: parseJson<FixChangesJson>(r.changes_json),
+    policy: parseJson<FixRecommendationListItem["policy"]>(r.policy_json),
+    tool_invocations: parseJson<ToolInvocation[]>(r.tool_inv_json),
+    summary_md: r.summary_md,
+    summary_one_liner: r.summary_one_liner,
+    rationale: r.rationale,
   }));
+
+  return items;
 }
 
 /** Optional: mark build failure as applied (after human confirms) */
@@ -199,13 +230,3 @@ export async function markApplied(failure_id: number) {
   await BuildFailure.update({ status: "applied" }, { where: { failure_id } });
 }
 
-/* ============================ Internals ============================ */
-
-function safeParse(s: string | null | undefined) {
-  if (!s) return null;
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
-}
