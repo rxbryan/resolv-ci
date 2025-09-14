@@ -65,61 +65,6 @@ async function validateReviewComments(
 }
 
 
-/** Fallback: synthesize review comments from changes using isNoop/appliesCleanly */
-function synthesizeCommentsFromChanges(
-  sol: SolutionsReturn | SolutionsOutput,
-  allowInlineSuggestions: boolean,
-  owner: string,
-  repo: string,
-  headSha: string
-) {
-  const changes = Array.isArray(sol.changes) ? sol.changes : [];
-  return changes.slice(0, MAX_REVIEW_COMMENTS).map((chg: Change) => {
-    const line = chg?.anchor?.line ?? 1;
-    const lang = chg?.language || null;
-    const code = (chg?.hunk?.after ?? "").toString();
-
-    const isNoop = !!chg?.validation?.isNoop;
-    const clean  = !!chg?.validation?.appliesCleanly;
-
-    //const link = makePermalink(owner, repo, headSha, chg.path, line);
-
-    if (isNoop) {
-      const body = [
-        `🔎 **Suggested fix** — add to \`${line}\`.`,
-        ``,
-        lang ? `\`\`\`${lang}\n${code}\n\`\`\`` : `\`\`\`\n${code}\n\`\`\``,
-        ``,
-        //`[🔗 Permalink](${link})`
-      ].join("\n");
-      return { path: chg.path, line, body };
-    }
-
-    if (allowInlineSuggestions && clean) {
-      const body = [
-        `💡 **Suggested fix**`,
-        ``,
-        "```suggestion",
-        code,
-        "```",
-        ``,
-        //`[🔗 Permalink](${link})`
-      ].join("\n");
-      return { path: chg.path, line, body };
-    }
-
-    const body = [
-      "💡 **Suggested fix (comment-only; please review)**",
-      "",
-      lang ? `\`\`\`${lang}\n${code}\n\`\`\`` : `\`\`\`\n${code}\n\`\`\``,
-      ``,
-      //`[🔗 Permalink](${link})`
-    ].join("\n");
-    return { path: chg.path, line, body };
-  });
-}
-
-
 function makePermalink(
   owner: string,
   repo: string,
@@ -174,20 +119,7 @@ export async function stageReviewOutboxFromSolution(p: StageFromSolutionParams) 
   const { owner, repo, pull_number, head_sha, installation_id } = p;
   const solution = normalizeSolution(p.solution);
 
-  // Policy guard (eligibility for inline suggestion blocks)
-  const tau = Number(process.env.SOLUTIONS_CONFIDENCE_TAU ?? "0.80");
-  const conf = Number(solution?.summary?.confidence ?? 0);
-  const lowRisk = (solution?.summary?.risk ?? "low") === "low";
-  const validAll = (solution?.changes ?? []).every((c: Change) => !!c?.validation?.appliesCleanly);
-  const hasRealFix = (solution?.changes ?? []).some((c: Change) => !c?.validation?.isNoop && !!c?.validation?.appliesCleanly);
-  const allowInlineSuggestions = conf >= tau && lowRisk && validAll && hasRealFix;
-
-  // Comments: prefer provided, else synthesize from changes w/ diagnostic labeling
-  const rawComments =
-  Array.isArray((solution as SolutionsReturn).reviewComments) && (solution as SolutionsReturn).reviewComments.length
-    ? (solution as SolutionsReturn).reviewComments
-    : synthesizeCommentsFromChanges(solution, allowInlineSuggestions, owner, repo, head_sha);
-  
+  const rawComments = (solution as SolutionsReturn).reviewComments
   const comments = rawComments.slice(0, MAX_REVIEW_COMMENTS).map((c)=>{return c});  // noop
   
   const body = clampLen(solution.summaryMarkdown , BODY_MAX_CHARS);

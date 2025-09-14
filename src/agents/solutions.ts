@@ -30,17 +30,24 @@ const MAX_PER_TOOL_MS    = Number(process.env.SOL_MAX_PER_TOOL_MS ?? "5000");
 /* 🔎 enable logs with DEBUG_SOLUTIONS=1 */
 const DEBUG_SOL = process.env.DEBUG_SOLUTIONS === "1";
 
+export type MatchHint = {
+  kind: "exact" | "regex" | "nearest_changed_hunk";
+  original?: string;
+  pattern?: string;
+} | null;
+
 export type Change = {
   path: string;
-  anchor: { line: number } | null;     // ← allow null
+  anchor: { line: number } | null;
   hunk: { after: string };
-  language: string | null;             // ← allow null
-  validation: {
-    appliesCleanly: boolean;
-    isNoop?: boolean;
-  };
+  language: string | null;
+  validation: { appliesCleanly: boolean; isNoop?: boolean };
   type?: "fix" | "diagnosis";
+  intent?: "insert_before" | "insert_after" | "replace" | null;
+  explain?: string | null;
+  match?: MatchHint;   // add this
 };
+
 
 export type SolutionsOutput = {
   summary: {
@@ -50,7 +57,7 @@ export type SolutionsOutput = {
     confidence: number;
     references: string[];                 // required with default []
   };
-  changes: Change[];                   // ← uses the nullable fields
+  changes: Change[];                   // uses the nullable fields
   tool_invocations: ToolInvocation[];             // required with default []
   policy: { autoSuggestionEligible: boolean; reason: string };
 };
@@ -100,7 +107,9 @@ const ChangeSchema = z.object({
     appliesCleanly: z.boolean(),
     isNoop: z.boolean().optional().default(false),
   }),
-  match: MatchSchema.nullable().default(null),  
+  match: MatchSchema.nullable().default(null),
+  intent: z.enum(["insert_before", "insert_after", "replace"]).nullable().default(null),
+  explain: z.string().nullable().default(null),
 });
 
 const SolutionsSchema = z.object({
@@ -214,6 +223,23 @@ function findLineFuzzy(content: string, needle: string): number | null {
     if (windowNorm === target) return i + 1;
   }
   return null;
+}
+
+function resolveDisplayAnchorFromMatch(
+  full: string,
+  ch: Change,
+  fallback?: number
+): number | null {
+  // Try exact/regex hints first
+  if (ch.match?.kind === "exact" && ch.match.original) {
+    const hit = findLineFuzzy(full, ch.match.original);
+    if (hit) return hit;
+  } else if (ch.match?.kind === "regex" && ch.match.pattern) {
+    const hit = findLineByRegex(full, ch.match.pattern);
+    if (hit) return hit;
+  }
+  // Fallback (e.g., 1 or first changed hunk)
+  return typeof fallback === "number" && fallback > 0 ? fallback : null;
 }
 
 
@@ -364,8 +390,16 @@ export async function solveFailure(
       If uncertain, use { kind:"nearest_changed_hunk" } to target the first changed hunk.`,
       `In "hunk.after", include ONLY the exact replacement lines (no context). 
         The number of lines must equal the intended replacement span.`,
-      "If your change wouldn’t alter the code after normalization, return a diagnostic instead of a fix.",
-      "Anchor precisely: include 1–2 original lines in `match.original` that appear verbatim in the file near the change.",
+      "If your change wouldn,t alter the code after normalization, return a diagnostic instead of a fix.",
+      "Anchor precisely: include 1-2 original lines in `match.original` that appear verbatim in the file near the change.",
+      "Always include 1-2 real lines in `match.original` that appear verbatim in the file near the change.",
+      "Return an `intent` for each change: one of `insert_after`, `insert_before`, or `replace`.",
+      "Also return a short `explain` sentence for the reviewer describing the action.",
+      "For diagnosis-only (no safe inline suggestion), still show `_Current_` (from `match.original`) and `_Proposed_` (from `hunk.after`) so a maintainer can apply it quickly.",
+      "Set `intent` precisely:\
+      - use `replace` if the proposed lines are meant to replace the lines in `match.original`;\
+      - use `insert_before` if the proposed lines must appear immediately before `match.original`;\
+      - use `insert_after` if the proposed lines must appear immediately after `match.original`."
     ].join("\n")
   );
 
@@ -415,7 +449,6 @@ export async function solveFailure(
 
       let result: unknown;
       let ms = 0;
-      let executed = false;
 
       // Check both global & per-tool budgets
       const globalOver = toolCalls >= MAX_TOOL_CALLS || (Date.now() - started) >= MAX_TOOL_MS;
@@ -465,7 +498,6 @@ export async function solveFailure(
               result = { error: `Unknown tool ${tc.name}` };
           }
           ms = Date.now() - t0;
-          executed = true;
         } catch (e) {
           ms = Date.now() - t0;
           result = { error: String((e as Error)?.message ?? e) };
@@ -562,9 +594,19 @@ export async function solveFailure(
     // File must belong to PR; else turn into diagnostic
     const meta = filesByPath.get(ch.path);
     if (!meta) {
-      validatedChanges.push({ ...ch, validation: { ...ch.validation, isNoop: true }, type: "diagnosis" });
+      // File not in PR diff → we can’t inline, but still compute a display anchor
+      const full = await getFileContent(octo, repo_owner, repo_name, commit_sha, ch.path);
+      const guess = resolveDisplayAnchorFromMatch(full, ch, /*fallback*/ 1);
+    
+      validatedChanges.push({
+        ...ch,
+        anchor: { line: guess ?? 1 },
+        validation: { ...ch.validation, isNoop: true },
+        type: "diagnosis",
+      });
       continue;
     }
+    
   
     // Get file content once
     const full = await getFileContent(octo, repo_owner, repo_name, commit_sha, ch.path);
@@ -613,13 +655,19 @@ export async function solveFailure(
       }
     }
 
+    // Anchor unresolved → diagnostic, but not a "no-op".
     if (!line || line < 1) {
-      // Anchor unresolved → diagnostic, but not a "no-op".
-      validatedChanges.push({ ...ch, validation: { ...ch.validation, isNoop: false }, type: "diagnosis" });
+      // Couldn’t resolve from hints — still derive a display anchor for the comment
+      const guess = resolveDisplayAnchorFromMatch(full, ch, /*fallback*/ 1);
+      validatedChanges.push({
+        ...ch,
+        anchor: { line: guess ?? 1 },              // give diagnostics a real display line
+        validation: { ...ch.validation, isNoop: false },
+        type: "diagnosis",
+      });
       continue;
     }
-
-    
+     
   
     // Compute exact window size = proposed lines
     const proposedRaw = String(ch.hunk?.after ?? "");
@@ -636,16 +684,43 @@ export async function solveFailure(
     // derive type (fix only if not noop and appliesCleanly)
     const applies = !!ch.validation?.appliesCleanly;
     const typ: "fix" | "diagnosis" = !noop && applies ? "fix" : "diagnosis";
-  
+
+    // Derive/normalize intent & explain for diagnostics (esp. noop)
+    let intent = ch.intent ?? null;
+    let explain = ch.explain ?? null;
+    const hasOriginal = !!ch.match?.original?.trim();
+    const originalNorm = hasOriginal ? normalizeBlock(ch.match!.original!) : "";
+    const differsFromOriginal = hasOriginal && originalNorm !== normalizeBlock(proposed);
+
+    // If model didn’t provide intent, infer a sensible one:
+    if (!intent) {
+      intent = differsFromOriginal ? "replace" : "insert_after";
+    }
+
+    // If explain missing, synthesize a friendly one:
+    if (!explain) {
+      if (intent === "replace" && hasOriginal) {
+        explain = "Replace the faulty line(s) shown in “Current” with “Proposed”.";
+      } else if (intent === "insert_before") {
+        explain = "Insert the proposed snippet immediately before this line.";
+      } else if (intent === "insert_after") {
+        explain = "Insert the proposed snippet immediately after this line.";
+      } else {
+        explain = "Reference location for the change.";
+      }
+    }
+
     validatedChanges.push({
       ...ch,
       anchor: { line: start },
       hunk: { after: proposed },
       validation: { ...ch.validation, isNoop: noop },
       type: typ,
+      intent,
+      explain,
     });
   }
-  
+
   // For policy: “real fixes” are clean & non-noop
   const realFixes = validatedChanges.filter(c => !c.validation.isNoop && c.validation.appliesCleanly);
   
@@ -672,33 +747,69 @@ export async function solveFailure(
 
   // Inline comments: diagnostics (no-op) vs suggestions (real fixes)
   const reviewComments = validatedChanges.map((chg) => {
-    const line = chg.anchor?.line ?? 1;
-
-    // Diagnostic anchor: no code change, show the helpful snippet
+    // Base start line resolved earlier (start of the matched/original region)
+    const baseLine = chg.anchor?.line ?? 1;
+  
+    // If we have original text, use its line count to compute the proper endpoint
+    const origLen =
+      chg.match?.original && chg.match.original.trim().length > 0
+        ? toLF(chg.match.original).split("\n").length
+        : 1;
+  
+    // Derive the *display* line depending on the intended action
+    const displayLine =
+      chg.intent === "insert_after"
+        ? baseLine + (origLen - 1) // after the last line of the original block
+        : baseLine;                // replace or insert_before: start line
+  
+    // Diagnostic-style comment (no inline suggestion)
     if (chg.validation?.isNoop || chg.type === "diagnosis") {
-      const body = [
-        `🔎 **Source of error** — This is a diagnostic anchor (no code change).`,
-        ``,
+      const verb =
+        chg.intent === "replace" ? "replace at" :
+        chg.intent === "insert_before" ? "add before" :
+        /* insert_after */ "add after";
+  
+      const blocks: string[] = [
+        `🔎 **Suggested fix — ${verb} \`line ${displayLine}\`**`
+      ];
+  
+      const hasOriginal = !!chg.match?.original?.trim();
+      if (hasOriginal) {
+        blocks.push(
+          "_Current:_",
+          chg.language
+            ? `\`\`\`${chg.language}\n${chg.match!.original!.trim()}\n\`\`\``
+            : `\`\`\`\n${chg.match!.original!.trim()}\n\`\`\``
+        );
+      }
+  
+      blocks.push(
+        "_Proposed:_",
         chg.language
           ? `\`\`\`${chg.language}\n${chg.hunk.after}\n\`\`\``
-          : `\`\`\`\n${chg.hunk.after}\n\`\`\``,
-      ].join("\n");
-      return { path: chg.path, line, body };
+          : `\`\`\`\n${chg.hunk.after}\n\`\`\``
+      );
+  
+      if (chg.explain) blocks.push(`_Note:_ ${chg.explain}`);
+  
+      const body = blocks.join("\n\n");
+      return { path: chg.path, line: displayLine, body };
     }
-
-    // Real fix: suggestion block only when eligible; otherwise comment-only hint
+  
+    // Real fix: suggestion block (inline) if eligible; else comment-only hint
     if (policy.autoSuggestionEligible && chg.validation?.appliesCleanly) {
       const body = ["💡 **Suggested fix**", "", "```suggestion", chg.hunk.after, "```"].join("\n");
-      return { path: chg.path, line, body };
+      return { path: chg.path, line: baseLine, body };
     } else {
       const body = [
         "💡 **Suggested fix (comment-only; please review)**",
         "",
         chg.language ? `\`\`\`${chg.language}\n${chg.hunk.after}\n\`\`\`` : `\`\`\`\n${chg.hunk.after}\n\`\`\``,
       ].join("\n");
-      return { path: chg.path, line, body };
+      return { path: chg.path, line: baseLine, body };
     }
   });
+  
 
   const final: SolutionsReturn = {
     summary: {
@@ -708,7 +819,7 @@ export async function solveFailure(
       confidence,
       references: sol.summary.references,
     },
-    changes: validatedChanges,   // ← use validated+typed changes
+    changes: validatedChanges,   // use validated+typed changes
     tool_invocations: [
       ...sol.tool_invocations,
       ...toolInvocations,        // already in {name,args_json,ms,ok} shape after Patch 2
