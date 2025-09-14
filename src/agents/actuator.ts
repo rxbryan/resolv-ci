@@ -15,22 +15,55 @@ function clampLen(s: string, max: number) {
   return s.length > max ? s.slice(0, max) + "\n\n… _truncated_" : s;
 }
 
-function buildSummaryMarkdown(sol: SolutionsReturn | SolutionsOutput) {
-  const one = sol.summary?.one_liner || "ResolvCI review";
-  const rat = sol.summary?.rationale || "";
-  const conf = typeof sol.summary?.confidence === "number"
-    ? `${Math.round((sol.summary.confidence ?? 0) * 100)}%`
-    : "—";
-  const risk = sol.summary?.risk || "low";
-  return [
-    `**ResolvCI** — ${one}`,
-    ``,
-    rat ? `**Rationale:** ${rat}` : "",
-    `**Confidence:** ${conf} • **Risk:** ${risk}`,
-    ``,
-    `**Legend:** 🔎 diagnostic anchor (source of error) • 💡 inline code suggestion`,
-  ].filter(Boolean).join("\n");
+type DraftComment = { path: string; line: number; body: string; side?: "RIGHT" | "LEFT" };
+
+function parseUnifiedDiffMaxRightLine(patch: string): number | null {
+  // Very light-weight: scan hunks like @@ -a,b +c,d @@ and track max right line
+  // This doesn’t validate every line, but prevents obviously out-of-range anchors.
+  let max = 0;
+  const re = /@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(patch))) {
+    const start = Number(m[1] || 0);
+    const len = Number(m[2] || 1);
+    const end = start + Math.max(0, len) - 1;
+    if (end > max) max = end;
+  }
+  return max || null;
 }
+
+async function validateReviewComments(
+  octo: Octokit,
+  owner: string,
+  repo: string,
+  pull_number: number,
+  comments: DraftComment[]
+): Promise<{ valid: DraftComment[]; diagnostics: DraftComment[] }> {
+  if (!comments?.length) return { valid: [], diagnostics: [] };
+
+  const { data: files } = await octo.rest.pulls.listFiles({ owner, repo, pull_number, per_page: 300 });
+  const byPath = new Map<string, { patch: string | null }>();
+  for (const f of files) byPath.set(f.filename, { patch: f.patch ?? null });
+
+  const valid: DraftComment[] = [];
+  const diagnostics: DraftComment[] = [];
+
+  for (const c of comments) {
+    const meta = byPath.get(c.path);
+    if (!meta) { diagnostics.push(c); continue; }           // path not in diff → diag
+    if (!meta.patch) { diagnostics.push(c); continue; }     // no patch (large/binary) → diag
+
+    const maxRight = parseUnifiedDiffMaxRightLine(meta.patch);
+    if (!maxRight || c.line < 1 || c.line > maxRight) {
+      diagnostics.push(c);                                  // out of range → diag
+      continue;
+    }
+    // Looks anchorable; ensure RIGHT side
+    valid.push({ ...c, side: c.side ?? "RIGHT" });
+  }
+  return { valid, diagnostics };
+}
+
 
 /** Fallback: synthesize review comments from changes using isNoop/appliesCleanly */
 function synthesizeCommentsFromChanges(
@@ -49,15 +82,15 @@ function synthesizeCommentsFromChanges(
     const isNoop = !!chg?.validation?.isNoop;
     const clean  = !!chg?.validation?.appliesCleanly;
 
-    const link = makePermalink(owner, repo, headSha, chg.path, line);
+    //const link = makePermalink(owner, repo, headSha, chg.path, line);
 
     if (isNoop) {
       const body = [
-        `🔎 **Source of error** — This is a diagnostic anchor (no code change).`,
+        `🔎 **Suggested fix** — add to \`${line}\`.`,
         ``,
         lang ? `\`\`\`${lang}\n${code}\n\`\`\`` : `\`\`\`\n${code}\n\`\`\``,
         ``,
-        `[🔗 Permalink](${link})`
+        //`[🔗 Permalink](${link})`
       ].join("\n");
       return { path: chg.path, line, body };
     }
@@ -70,7 +103,7 @@ function synthesizeCommentsFromChanges(
         code,
         "```",
         ``,
-        `[🔗 Permalink](${link})`
+        //`[🔗 Permalink](${link})`
       ].join("\n");
       return { path: chg.path, line, body };
     }
@@ -80,7 +113,7 @@ function synthesizeCommentsFromChanges(
       "",
       lang ? `\`\`\`${lang}\n${code}\n\`\`\`` : `\`\`\`\n${code}\n\`\`\``,
       ``,
-      `[🔗 Permalink](${link})`
+      //`[🔗 Permalink](${link})`
     ].join("\n");
     return { path: chg.path, line, body };
   });
@@ -149,42 +182,27 @@ export async function stageReviewOutboxFromSolution(p: StageFromSolutionParams) 
   const hasRealFix = (solution?.changes ?? []).some((c: Change) => !c?.validation?.isNoop && !!c?.validation?.appliesCleanly);
   const allowInlineSuggestions = conf >= tau && lowRisk && validAll && hasRealFix;
 
-  // Body: prefer provided, else synthesize
-  const rawBody =
-    solution.summaryMarkdown && solution.summaryMarkdown.trim().length
-      ? solution.summaryMarkdown
-      : buildSummaryMarkdown(solution);
-
   // Comments: prefer provided, else synthesize from changes w/ diagnostic labeling
   const rawComments =
   Array.isArray((solution as SolutionsReturn).reviewComments) && (solution as SolutionsReturn).reviewComments.length
     ? (solution as SolutionsReturn).reviewComments
     : synthesizeCommentsFromChanges(solution, allowInlineSuggestions, owner, repo, head_sha);
-
-
-  /**
-   * Enforce caps/truncation
-   * Ensure we have permalinks (even when reviewComments came from Solutions)
-   */
-  const ensurePermalink = (c: { path: string; line: number; body: string }) => {
-    if (/github\.com\/.+\/blob\/.+#L\d+/.test(c.body)) return c; // already has one
-    const link = makePermalink(owner, repo, head_sha, c.path, c.line);
-    return { ...c, body: `${c.body}\n\n[🔗 Permalink](${link})` };
-  };
   
-  const comments = rawComments.slice(0, MAX_REVIEW_COMMENTS).map(ensurePermalink);
+  const comments = rawComments.slice(0, MAX_REVIEW_COMMENTS).map((c)=>{return c});  // noop
   
-  const body = clampLen(rawBody, BODY_MAX_CHARS);
+  const body = clampLen(solution.summaryMarkdown , BODY_MAX_CHARS);
 
   const payload = {
     type: "pr_review" as const,
     owner,
     repo,
     pull_number,
+    head_sha,          
     event: "COMMENT",
     body,
     comments,
   };
+
 
   // Deterministic idempotency key: content + head_sha
   const action_hash = sha1(
@@ -313,6 +331,21 @@ export async function dispatchOneOutboundAction(a: OutboundRow) {
   }
 
   const octo = await getOctoForAction(a);
+  const { valid, diagnostics } = await validateReviewComments(
+    octo, payload.owner, payload.repo, payload.pull_number, payload.comments || []
+  );
+
+  // Fold un-anchorable items into the top body as diagnostics
+  let body = String(payload.body || "");
+
+  if (diagnostics.length) {
+    console.log("[Actuator] diagnostics:", diagnostics[0], valid)
+    const bullets = diagnostics.map(d => {
+      const link = makePermalink(payload.owner, payload.repo, payload.head_sha, d.path, d.line);
+      return `- 🔎 **Source of error** at [\`${d.path}:${d.line}\`](${link})\n${d.body}`;
+    }).join("\n");  
+    body += `\n\n---\n**Diagnostics:**\n${bullets}`;
+  }
 
   try {
     if (DEBUG) {
@@ -322,22 +355,26 @@ export async function dispatchOneOutboundAction(a: OutboundRow) {
         pull_number: payload.pull_number,
         comments: (payload.comments || []).length,
         body_len: (payload.body || "").length,
+        body
       });
     }
 
+    //console.log("[Actuator] posting review:", payload.comments[0].body)
     await octo.rest.pulls.createReview({
       owner: payload.owner,
       repo: payload.repo,
       pull_number: payload.pull_number,
+      commit_id: payload.head_sha,
       event: payload.event || "COMMENT",
-      body: payload.body,
-      comments: (payload.comments || []).map((c: GitHubComment) => ({
+      body,
+      comments: valid.map((c: GitHubComment) => ({
         path: c.path,
         line: c.line,
         side: c.side || "RIGHT",
         body: c.body,
       })),
     });
+  
 
     if (OutboundAction) {
       await OutboundAction.update(

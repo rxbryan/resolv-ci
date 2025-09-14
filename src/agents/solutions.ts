@@ -20,9 +20,12 @@ import { AnalysisOutput } from "./analysis";
 /* ============================== Config ============================== */
 
 const MODEL = process.env.LLM_MODEL_CHAT || "gpt-4o-mini";
-const MAX_TOOL_CALLS = Number(process.env.SOL_MAX_TOOL_CALLS ?? "3");
-const MAX_TOOL_MS = Number(process.env.SOL_MAX_TOOL_MS ?? "5000"); // ~5s cap
+const MAX_TOOL_CALLS = Number(process.env.SOL_MAX_TOOL_CALLS ?? "6");
+const MAX_TOOL_MS = Number(process.env.SOL_MAX_TOOL_MS ?? "10000"); // ~5s cap
 const TAU = Number(process.env.SOLUTIONS_CONFIDENCE_TAU ?? "0.80");
+// Per-tool budgets (caps each tool individually)
+const MAX_PER_TOOL_CALLS = Number(process.env.SOL_MAX_PER_TOOL_CALLS ?? "3");
+const MAX_PER_TOOL_MS    = Number(process.env.SOL_MAX_PER_TOOL_MS ?? "5000");
 
 /* 🔎 enable logs with DEBUG_SOLUTIONS=1 */
 const DEBUG_SOL = process.env.DEBUG_SOLUTIONS === "1";
@@ -81,6 +84,13 @@ const CodeSearchSchema = z.object({
   max: z.number().int().optional().default(10),
 });
 
+const MatchSchema = z.object({
+  kind: z.enum(["exact", "regex", "nearest_changed_hunk"]).default("nearest_changed_hunk"),
+  original: z.string().optional().default(""),  // for kind="exact"
+  pattern: z.string().optional().default(""),   // for kind="regex"
+});
+
+
 const ChangeSchema = z.object({
   path: z.string(),
   anchor: z.object({ line: z.number().int().min(1) }).nullable().default(null),
@@ -90,6 +100,7 @@ const ChangeSchema = z.object({
     appliesCleanly: z.boolean(),
     isNoop: z.boolean().optional().default(false),
   }),
+  match: MatchSchema.nullable().default(null),  
 });
 
 const SolutionsSchema = z.object({
@@ -125,13 +136,100 @@ async function getOcto(owner: string, repo: string, installationId?: number | nu
   return await getOctokitForRepo(owner, repo);
 }
 
-function normalizeWS(s: string) {
+function stripFence(s: string): string {
+  let out = s ?? "";
+  out = out.replace(/^```(?:suggestion|[a-z0-9_-]+)?\s*\n/i, "");
+  out = out.replace(/\n```$/i, "");
+  return out;
+}
+
+function normalizeBlock(s: string) {
   return (s ?? "").replace(/\r\n/g, "\n").replace(/[ \t]+/g, " ").trim();
 }
 
-function isNoopChange(original: string, proposed: string) {
-  return normalizeWS(original) === normalizeWS(proposed);
+async function getFileContent(octo: Octokit, owner: string, repo: string, ref: string, path: string): Promise<string> {
+  const res = await octo.rest.repos.getContent({ owner, repo, path, ref });
+  if (!("content" in res.data)) return "";
+  return Buffer.from((res.data as any).content, "base64").toString("utf8");
 }
+
+function firstChangedHunkStart(patch: string | null): number | null {
+  if (!patch) return null;
+  const m = /@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(patch);
+  if (!m) return null;
+  const start = Number(m[1] || 1);
+  return Math.max(1, start);
+}
+
+function toLF(s: string) {
+  return (s ?? "").replace(/\r\n/g, "\n");
+}
+
+/** 
+ * If we have an approximate start, search a small window around it
+ * for an exact/fuzzy occurrence of `original`. Returns a 1-based line if found.
+ */
+function nudgeAnchor(full: string, original: string, start: number, radius = 8): number | null {
+  const hay = toLF(full).split("\n");
+  if (start < 1) start = 1;
+  const lo = Math.max(1, start - radius);
+  const hi = Math.min(hay.length, start + radius);
+
+  // Search the window using the same fuzzy logic
+  const windowText = hay.slice(lo - 1, hi).join("\n");
+  const hit = findLineFuzzy(windowText, original);
+  return hit ? lo + hit - 1 : null;
+}
+
+function findLineFuzzy(content: string, needle: string): number | null {
+  if (!needle) return null;
+
+  const toLF = (s: string) => s.replace(/\r\n/g, "\n");
+
+  // Pass 1: exact match but tolerant to trailing whitespace per line
+  const hay1 = toLF(content);
+  const pin1 = toLF(needle).replace(/[ \t]+$/gm, ""); // strip trailing ws per line
+  const idx = hay1.indexOf(pin1);
+  if (idx >= 0) return hay1.slice(0, idx).split("\n").length; // 1-based
+
+  // Pass 2: whitespace-collapsed windowed search (single or multi-line)
+  const collapseWS = (s: string) => s.replace(/[ \t]+/g, " ").trim();
+  const hayLines = hay1.split("\n");
+  const pinLines = toLF(needle).split("\n");
+
+  // Single-line
+  if (pinLines.length === 1) {
+    const target = collapseWS(pinLines[0]);
+    for (let i = 0; i < hayLines.length; i++) {
+      if (collapseWS(hayLines[i]) === target) return i + 1;
+    }
+    return null;
+  }
+
+  // Multi-line window
+  const n = pinLines.length;
+  const target = pinLines.map(collapseWS).join("\n");
+  for (let i = 0; i + n <= hayLines.length; i++) {
+    const windowNorm = hayLines.slice(i, i + n).map(collapseWS).join("\n");
+    if (windowNorm === target) return i + 1;
+  }
+  return null;
+}
+
+
+function findLineByRegex(content: string, pattern: string): number | null {
+  if (!pattern) return null;
+  try {
+    const re = new RegExp(pattern, "m");
+    const m = re.exec(content);
+    if (!m) return null;
+    return content.slice(0, m.index).split("\n").length;
+  } catch {
+    return null;
+  }
+}
+
+
 
 // list_pr_files: enumerate changed files (+ unified diff patches)
 const listPRFilesTool = tool(
@@ -260,6 +358,14 @@ export async function solveFailure(
       `Budgets: max ${MAX_TOOL_CALLS} tool calls, ≤ ${Math.round(MAX_TOOL_MS / 1000)}s total tool time.`,
       "Output MUST conform to the SolutionsOutput JSON contract.",
       "If not confident, return diagnosis-only (no suggestions).",
+      "Only modify files that are part of this PR.",
+      `Provide a 'match' hint for anchoring: 
+      { kind:"exact", original:"<old lines>"} or { kind:"regex", pattern:"<js regex>"}.
+      If uncertain, use { kind:"nearest_changed_hunk" } to target the first changed hunk.`,
+      `In "hunk.after", include ONLY the exact replacement lines (no context). 
+        The number of lines must equal the intended replacement span.`,
+      "If your change wouldn’t alter the code after normalization, return a diagnostic instead of a fix.",
+      "Anchor precisely: include 1–2 original lines in `match.original` that appear verbatim in the file near the change.",
     ].join("\n")
   );
 
@@ -299,79 +405,106 @@ export async function solveFailure(
     messages.push(ai);
   
     const calls = (ai as AIMessage).tool_calls ?? [];
-    if (!calls.length) {
-      // Model produced a final answer (no tools) → exit loop
-      break;
-    }
-  
-    /* eslint-disable @typescript-eslint/no-explicit-any */
-    // Execute each requested tool
+    if (!calls.length) break;
+
+    // Execute each requested tool — ALWAYS reply with a ToolMessage
     for (const tc of calls) {
       const args = typeof tc.args === "string" ? safeParseJson(tc.args) : (tc.args ?? {});
-      let result: any;
-      const t0 = Date.now();
-  
-      try {
-        switch (tc.name) {
-          case "list_pr_files":
-            result = await listPRFilesTool.invoke(args as any, { configurable: { octo } } as any);
-            break;
-          case "fetch_slice":
-            // inject repo defaults
-            result = await fetchSliceTool.invoke(
-              { owner: repo_owner, repo: repo_name, ref: commit_sha, ...args } as any,
-              { configurable: { octo } } as any
-            );
-            break;
-          case "code_search":
-            result = await codeSearchTool.invoke(
-              { owner: repo_owner, repo: repo_name, ...args } as any,
-              { configurable: { octo } } as any
-            );
-            break;
-          default:
-            result = { error: `Unknown tool ${tc.name}` };
+      const callsForTool = toolCounts[tc.name] ?? 0;
+      const timeForTool  = toolTimeMs[tc.name] ?? 0;
+
+      let result: unknown;
+      let ms = 0;
+      let executed = false;
+
+      // Check both global & per-tool budgets
+      const globalOver = toolCalls >= MAX_TOOL_CALLS || (Date.now() - started) >= MAX_TOOL_MS;
+      const perToolOver = callsForTool >= MAX_PER_TOOL_CALLS || timeForTool >= MAX_PER_TOOL_MS;
+
+      if (globalOver || perToolOver) {
+        // Synthesize a “budget exhausted” result but STILL reply with ToolMessage
+        result = {
+          error: "budget_exhausted",
+          used: {
+            global_calls: toolCalls,
+            global_ms: Date.now() - started,
+            tool_calls: callsForTool,
+            tool_ms: timeForTool,
+          },
+          limits: {
+            global_calls: MAX_TOOL_CALLS,
+            global_ms: MAX_TOOL_MS,
+            tool_calls: MAX_PER_TOOL_CALLS,
+            tool_ms: MAX_PER_TOOL_MS,
+          },
+        };
+      } else {
+        const t0 = Date.now();
+        try {
+          switch (tc.name) {
+            case "list_pr_files":
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              result = await listPRFilesTool.invoke(args as any, { configurable: { octo } } as any);
+              break;
+            case "fetch_slice":
+              // inject repo defaults
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              result = await fetchSliceTool.invoke(
+                { owner: repo_owner, repo: repo_name, ref: commit_sha, ...args } as any,
+                { configurable: { octo } } as any
+              );
+              break;
+            case "code_search":
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              result = await codeSearchTool.invoke(
+                { owner: repo_owner, repo: repo_name, ...args } as any,
+                { configurable: { octo } } as any
+              );
+              break;
+            default:
+              result = { error: `Unknown tool ${tc.name}` };
+          }
+          ms = Date.now() - t0;
+          executed = true;
+        } catch (e) {
+          ms = Date.now() - t0;
+          result = { error: String((e as Error)?.message ?? e) };
         }
-      } catch (e: any) {
-        result = { error: String(e?.message ?? e) };
       }
-  
-      const ms = Date.now() - t0;
-  
-      // record + log
+
+      // Record usage
       toolInvocations.push({
         name: tc.name,
-        args_json: safePreview(args, 2000),  // keep it small; schema wants a string
+        args_json: safePreview(args, 2000),
         ms,
-        ok: !result?.error,
+        ok: !(result as any)?.error,
       });
-      toolCounts[tc.name] = (toolCounts[tc.name] ?? 0) + 1;
-      toolTimeMs[tc.name] = (toolTimeMs[tc.name] ?? 0) + ms;
-  
+      toolCounts[tc.name] = (toolCounts[tc.name] ?? 0) + 1;   // count even if budget_exhausted
+      toolTimeMs[tc.name]  = (toolTimeMs[tc.name] ?? 0) + ms;
+      toolCalls++;
+
       if (DEBUG_SOL) {
-        console.log(`[Solutions] tool=${tc.name} ms=${ms} ok=${!result?.error}`);
-        console.log(`[Solutions] args: ${safePreview(args)}`);
-        console.log(`[Solutions] result: ${safePreview(result)}`);
+        console.log(`[Solutions] tool=${tc.name} ms=${ms} ok=${!(result as any)?.error}`);
       }
-  
-      // IMPORTANT: respond with a ToolMessage that references THIS tool call
-      if (!tc.id) {
-        if (DEBUG_SOL) console.warn("[Solutions] missing tool_call_id; skipping ToolMessage for:", tc.name);
-      } else {
+
+      // ALWAYS reply to the tool call (satisfy the API invariant)
+      if (tc.id) {
         messages.push(
           new ToolMessage({
             tool_call_id: tc.id,
             content: JSON.stringify(result),
           })
         );
+      } else if (DEBUG_SOL) {
+        console.warn("[Solutions] tool_call had no id; replied skipped but id was missing:", tc.name);
       }
-  
-      toolCalls++;
-      if (toolCalls >= MAX_TOOL_CALLS || Date.now() - started >= MAX_TOOL_MS) break;
     }
-    /* eslint-enable @typescript-eslint/no-explicit-any */
-  
+    // end-for (we answered ALL tool_calls for this assistant message)
+
+    // Now it is safe to continue the while loop; the next model turn will see our ToolMessages
     // loop continues: the model will see the tool results we just appended
+
+    /* eslint-enable @typescript-eslint/no-explicit-any */
   }
   
 
@@ -392,56 +525,126 @@ export async function solveFailure(
       `- < 0.60 or invalid anchors → summary-only`,
     ].join("\n")
   );
+  
+  // Safety net: ensure no assistant tool_calls remain unanswered
+  const last = messages[messages.length - 1];
+  if (last instanceof AIMessage) {
+    const toolCalls = last.tool_calls ?? [];
+    if (toolCalls.length > 0) {
+      for (const tc of toolCalls) {
+        if (tc?.id) {
+          messages.push(
+            new ToolMessage({
+              tool_call_id: tc.id,
+              content: JSON.stringify({ error: "unanswered_tool_call_safety_net" }),
+            })
+          );
+        }
+      }
+    }
+  }
+
+
 
   const result = await finalModel.invoke([...messages, policyHint]);
+  console.log(`final model out: ${result}`)
 
   // Build outbound review artifacts
   const sol = SolutionsSchema.parse(result);
   const confidence = clamp01(sol.summary.confidence ?? 0);
   const lowRisk = sol.summary.risk === "low";
   
-  /**
-   * Validate each proposed change by fetching a nearby slice and
-   * marking isNoop if the proposed content matches the current content (ignoring whitespace).
-   */
+  const prFiles = await octo.rest.pulls.listFiles({ owner: repo_owner, repo: repo_name, pull_number: pr_number, per_page: 300 });
+  const filesByPath = new Map(prFiles.data.map(f => [f.filename, { patch: f.patch ?? null }]));
+
   const validatedChanges: Change[] = [];
   for (const ch of sol.changes) {
-    try {
-      /* eslint-disable @typescript-eslint/no-explicit-any */
-      const slice = await fetchSliceTool.invoke(
-        {
-          owner: repo_owner,
-          repo: repo_name,
-          ref: commit_sha,
-          path: ch.path,
-          start_line: ch.anchor?.line ? Math.max(1, ch.anchor.line - 5) : 1,
-          end_line: ch.anchor?.line ? ch.anchor.line + 5 : null,
-        } as z.infer<typeof FetchSliceSchema>,
-        { configurable: { octo } } as any
-      );
-      const current = String((slice as any)?.slice ?? "");
-      /* eslint-enable @typescript-eslint/no-explicit-any */
-      const proposed = ch.hunk?.after ?? "";
-      const noop = isNoopChange(current, proposed);
-  
-      // ← derive type here; don't read ch.type
-      const typ: "fix" | "diagnosis" =
-        !noop && ch.validation?.appliesCleanly ? "fix" : "diagnosis";
-  
-      validatedChanges.push({
-        ...ch,
-        validation: { ...ch.validation, isNoop: noop },
-        type: typ,
-      });
-    } catch {
-      validatedChanges.push({
-        ...ch,
-        validation: { ...ch.validation, isNoop: true },
-        type: "diagnosis",
-      });
+    // File must belong to PR; else turn into diagnostic
+    const meta = filesByPath.get(ch.path);
+    if (!meta) {
+      validatedChanges.push({ ...ch, validation: { ...ch.validation, isNoop: true }, type: "diagnosis" });
+      continue;
     }
-  }
   
+    // Get file content once
+    const full = await getFileContent(octo, repo_owner, repo_name, commit_sha, ch.path);
+  
+    // Resolve anchor line (always try match hints; treat line=1 as “needs refinement”)
+    let line = ch.anchor?.line ?? null;
+    const match = ch.match;
+
+    if (match?.kind === "exact" && match.original) {
+      // Prefer a true content hit
+      const found = findLineFuzzy(full, match.original);
+      if (found) {
+        line = found;
+      } else if (line != null) {
+        // If model gave a guess (often 1), try nudging nearby
+        const nudged = nudgeAnchor(full, match.original, line, 12);
+        if (nudged) line = nudged;
+      }
+      // If still no luck, fall back to first changed hunk
+      if (!line || line < 1) line = firstChangedHunkStart(meta.patch);
+    } else if (match?.kind === "regex" && match.pattern) {
+      const found = findLineByRegex(full, match.pattern);
+      if (found) line = found;
+      if (!line || line < 1) line = firstChangedHunkStart(meta.patch);
+    } else {
+      // No hint at all → use changed hunk; if model gave 1, still prefer a real hunk start
+      if (!line || line <= 1) line = firstChangedHunkStart(meta.patch);
+    }
+
+    if (DEBUG_SOL) {
+      console.log(`[anchor] path=${ch.path} rawLine=${ch.anchor?.line ?? null} resolved=${line} matchKind=${match?.kind} hasOriginal=${!!match?.original}`);
+    }
+    
+
+    // Final snap: if proposed is single-line, and an identical current line exists within ±2 lines, snap to it.
+    if (line && ch.hunk?.after && !ch.hunk.after.includes("\n")) {
+      const lines = toLF(full).split("\n");
+      const target = normalizeBlock(ch.hunk.after);
+      const l0 = Math.max(1, line - 2);
+      const l1 = Math.min(lines.length, line + 2);
+      for (let i = l0; i <= l1; i++) {
+        if (normalizeBlock(lines[i - 1]) === target) {
+          line = i;
+          break;
+        }
+      }
+    }
+
+    if (!line || line < 1) {
+      // Anchor unresolved → diagnostic, but not a "no-op".
+      validatedChanges.push({ ...ch, validation: { ...ch.validation, isNoop: false }, type: "diagnosis" });
+      continue;
+    }
+
+    
+  
+    // Compute exact window size = proposed lines
+    const proposedRaw = String(ch.hunk?.after ?? "");
+    const proposed = stripFence(proposedRaw);
+    const nLines = Math.max(1, proposed.split("\n").length);
+    const start = line;
+    const end = start + nLines - 1;
+  
+    // Extract current lines
+    const lines = full.split("\n");
+    const current = lines.slice(start - 1, Math.min(end, lines.length)).join("\n");
+    const noop = normalizeBlock(current) === normalizeBlock(proposed);
+  
+    // derive type (fix only if not noop and appliesCleanly)
+    const applies = !!ch.validation?.appliesCleanly;
+    const typ: "fix" | "diagnosis" = !noop && applies ? "fix" : "diagnosis";
+  
+    validatedChanges.push({
+      ...ch,
+      anchor: { line: start },
+      hunk: { after: proposed },
+      validation: { ...ch.validation, isNoop: noop },
+      type: typ,
+    });
+  }
   
   // For policy: “real fixes” are clean & non-noop
   const realFixes = validatedChanges.filter(c => !c.validation.isNoop && c.validation.appliesCleanly);
@@ -465,7 +668,6 @@ export async function solveFailure(
     `**Rationale:** ${sol.summary.rationale}`,
     `**Confidence:** ${(confidence * 100).toFixed(0)}% • **Risk:** ${sol.summary.risk}`,
     ``,
-    `**Legend:** 🔎 diagnostic anchor (source of error) • 💡 inline code suggestion`,
   ].join("\n");
 
   // Inline comments: diagnostics (no-op) vs suggestions (real fixes)
