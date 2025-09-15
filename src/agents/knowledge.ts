@@ -42,7 +42,7 @@ type PersistParams = {
  * Persist solution artifacts & mark the failure as 'proposed'.
  * Idempotent on (failure_id, head_sha) via unique key in DDL.
  *
- * Option B: also sets `summary_one_liner` and `rationale` columns to
+ * also sets `summary_one_liner` and `rationale` columns to
  * improve the auto-embedded vector quality.
  */
 export async function recordSolutionArtifacts(p: PersistParams) {

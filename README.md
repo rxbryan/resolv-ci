@@ -18,12 +18,20 @@ ResolvCI mirrors the classic control-systems pattern:
 In our case, “the world” is GitHub.
 
 * **GitHub App (Ingestion Agent)**
+  It's is a kind of ambient agent. It waits for check run events and triggers our langgraph workflow when a check run failure occurs. 
   Verifies HMAC, dedupes deliveries, pulls workflow logs, computes stable **error signatures** and a normalized tail, and upserts a row in TiDB.
 
 * **Analysis Agent (grounded retrieval)**
   Uses an LLM to **structure** the failure (error class, hints, keywords), then runs **hybrid retrieval** in TiDB:
 
   * **Exact**: persisted signatures `error_signature_v1/v2`
+    - error_signature_v1: `sha1(normalize(tailLines(log, 200)))`
+    - error_signature_v2 (semantic-lite):  hash of the *structured* fields below
+
+```json
+  { "error_class": "...", "message_template": "...", "failing_test": "...", "file_hint": "..." }
+  ```
+
   * **Semantic**: auto-embedded vectors on `norm_tail_vec` and past **fix\_recommendations** (Amazon Titan v2 via TiDB Cloud)
 
 * **Solutions Agent (autonomous + tools, read-only)**

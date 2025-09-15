@@ -50,8 +50,8 @@ async function validateReviewComments(
 
   for (const c of comments) {
     const meta = byPath.get(c.path);
-    if (!meta) { diagnostics.push(c); continue; }           // path not in diff → diag
-    if (!meta.patch) { diagnostics.push(c); continue; }     // no patch (large/binary) → diag
+    if (!meta) { diagnostics.push(c); continue; }           // if path not in diff -> diag
+    if (!meta.patch) { diagnostics.push(c); continue; }     // if no patch (large/binary) -> diag
 
     const maxRight = parseUnifiedDiffMaxRightLine(meta.patch);
     if (!maxRight || c.line < 1 || c.line > maxRight) {

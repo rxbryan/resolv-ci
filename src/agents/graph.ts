@@ -54,7 +54,7 @@ export type GState = typeof GraphState.State;
 
 /** Build the graph with chaining so TS learns node names for addEdge(). */
 const builder = new StateGraph(GraphState)
-  // Pass-through start (you can enrich from DB if needed)
+  // Pass-through start (could do some post processing here)
   .addNode("ingestion", async () => ({}))
 
   // Analysis: LLM structuring + similar failures + TiDB vector prior fixes
@@ -83,8 +83,8 @@ const builder = new StateGraph(GraphState)
         repo_owner: s.repo_owner,
         repo_name: s.repo_name,
         pr_number: s.pr_number,
-        commit_sha: s.head_sha,              // ← was head_sha; param name is commit_sha
-        log_content: s.log_content,          // ← was log_tail; pass the actual log content
+        commit_sha: s.head_sha,              // head_sha/commit_sha
+        log_content: s.log_content,          // log_tail; pass the actual log content
         installation_id: s.installation_id ?? null,
       },
       // pass the prior analysis block (shape matches Solutions’ expectations)
@@ -93,7 +93,7 @@ const builder = new StateGraph(GraphState)
 
     return {
       ...s,
-      solution: res,                         // ← whole SolutionsReturn
+      solution: res,                         // whole SolutionsReturn
       confidence: res.summary?.confidence ?? 0.6,
       insight_loops: (s.insight_loops ?? 0) + 1,
       // messages unchanged; SolutionsReturn doesn’t include messages
