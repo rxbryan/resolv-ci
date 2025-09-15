@@ -47,7 +47,10 @@ export async function POST(req: NextRequest) {
     }
 
     const first = await recordWebhookDelivery(deliveryId, eventType, payload);
-    if (!first) return NextResponse.json({ ok: true, deduped: true });
+    if (!first) {
+      console.log(`[webhook] [Event]: An error occured while in recordWebhookDelivery. Abortiing! `)
+      return NextResponse.json({ ok: true, deduped: true });
+    }
 
     const repoOwner = payload.repository?.owner?.login ?? "unknown";
     const repoName  = payload.repository?.name ?? "unknown";

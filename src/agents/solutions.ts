@@ -27,7 +27,7 @@ const TAU = Number(process.env.SOLUTIONS_CONFIDENCE_TAU ?? "0.80");
 const MAX_PER_TOOL_CALLS = Number(process.env.SOL_MAX_PER_TOOL_CALLS ?? "3");
 const MAX_PER_TOOL_MS    = Number(process.env.SOL_MAX_PER_TOOL_MS ?? "5000");
 
-/* 🔎 enable logs with DEBUG_SOLUTIONS=1 */
+/* enable logs with DEBUG_SOLUTIONS=1 */
 const DEBUG_SOL = process.env.DEBUG_SOLUTIONS === "1";
 
 export type MatchHint = {
@@ -45,7 +45,7 @@ export type Change = {
   type?: "fix" | "diagnosis";
   intent?: "insert_before" | "insert_after" | "replace" | null;
   explain?: string | null;
-  match?: MatchHint;   // add this
+  match?: MatchHint| null;   // add this
 };
 
 
@@ -91,12 +91,37 @@ const CodeSearchSchema = z.object({
   max: z.number().int().optional().default(10),
 });
 
-const MatchSchema = z.object({
-  kind: z.enum(["exact", "regex", "nearest_changed_hunk"]).default("nearest_changed_hunk"),
-  original: z.string().optional().default(""),  // for kind="exact"
-  pattern: z.string().optional().default(""),   // for kind="regex"
-});
+// Helper used by Zod refine
+function isValidRegex(p: string): boolean {
+  try {
+    // Require it to compile with flags we actually use
+    // (multiline + dotAll + unicode). No /delimiters/.
+    // e.g. "function\\s+add\\(a,\\s*b\\)" is valid.
+    void new RegExp(p, "msu");
+    return true;
+  } catch {
+    return false;
+  }
+}
 
+// Use a discriminated union so wrong fields are rejected
+const MatchSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("exact"),
+    original: z.string().min(1),
+    // forbid pattern in exact hints
+  }),
+  z.object({
+    kind: z.literal("regex"),
+    pattern: z.string().min(1).refine(isValidRegex, {
+      message: "pattern must be a valid JavaScript regex (no leading/trailing /) and must compile with flags 'msu'",
+    }),
+    // forbid original in regex hints
+  }),
+  z.object({
+    kind: z.literal("nearest_changed_hunk"),
+  }),
+]);
 
 const ChangeSchema = z.object({
   path: z.string(),
@@ -388,6 +413,8 @@ export async function solveFailure(
       `Provide a 'match' hint for anchoring: 
       { kind:"exact", original:"<old lines>"} or { kind:"regex", pattern:"<js regex>"}.
       If uncertain, use { kind:"nearest_changed_hunk" } to target the first changed hunk.`,
+      "always attempt to set `match.pattern`, and make sure the value you set to pattern is a valid regex",
+      "match.pattern should hint to the line where our your fix will apply",
       `In "hunk.after", include ONLY the exact replacement lines (no context). 
         The number of lines must equal the intended replacement span.`,
       "If your change wouldn,t alter the code after normalization, return a diagnostic instead of a fix.",
@@ -611,35 +638,64 @@ export async function solveFailure(
     // Get file content once
     const full = await getFileContent(octo, repo_owner, repo_name, commit_sha, ch.path);
   
-    // Resolve anchor line (always try match hints; treat line=1 as “needs refinement”)
-    let line = ch.anchor?.line ?? null;
-    const match = ch.match;
-
-    if (match?.kind === "exact" && match.original) {
-      // Prefer a true content hit
-      const found = findLineFuzzy(full, match.original);
-      if (found) {
-        line = found;
-      } else if (line != null) {
-        // If model gave a guess (often 1), try nudging nearby
-        const nudged = nudgeAnchor(full, match.original, line, 12);
-        if (nudged) line = nudged;
-      }
-      // If still no luck, fall back to first changed hunk
-      if (!line || line < 1) line = firstChangedHunkStart(meta.patch);
-    } else if (match?.kind === "regex" && match.pattern) {
-      const found = findLineByRegex(full, match.pattern);
-      if (found) line = found;
-      if (!line || line < 1) line = firstChangedHunkStart(meta.patch);
-    } else {
-      // No hint at all → use changed hunk; if model gave 1, still prefer a real hunk start
-      if (!line || line <= 1) line = firstChangedHunkStart(meta.patch);
-    }
-
     if (DEBUG_SOL) {
-      console.log(`[anchor] path=${ch.path} rawLine=${ch.anchor?.line ?? null} resolved=${line} matchKind=${match?.kind} hasOriginal=${!!match?.original}`);
+      console.log(
+        `[fetch] got ${full ? "content" : "EMPTY"} — path=${ch.path} ` +
+        `len=${full.length} lines=${toLF(full).split("\n").length}`
+      );
     }
     
+    // Resolve anchor line (always try match hints; treat line=1 as “unknown”)
+    let line = ch.anchor?.line && ch.anchor.line > 1 ? ch.anchor.line : null;
+    const match = ch.match;
+
+    // before resolution
+    let fuzzyFound: number | null = null;
+    let regexFound: number | null = null;
+    let nudged: number | null = null;
+    const hunkStart = firstChangedHunkStart(meta.patch);
+
+    // exact
+    if (match?.kind === "exact" && match.original) {
+      fuzzyFound = findLineFuzzy(full, match.original);
+      if (fuzzyFound) {
+        line = fuzzyFound;
+      } else if (line != null) {
+        nudged = nudgeAnchor(full, match.original, line, 12);
+        if (nudged) line = nudged;
+      }
+      if (!line || line <= 1) line = hunkStart ?? line;
+    }
+
+    // regex
+    if ((!line || line <= 1) && match?.kind === "regex") {
+      regexFound = findLineByRegex(full, match.pattern);
+      if (regexFound) line = regexFound;
+      if (!line || line <= 1) line = hunkStart ?? line;
+    }
+
+    // final guard
+    if (!line || line <= 1) line = hunkStart ?? 1;
+
+    if (DEBUG_SOL) {
+      const hasOriginalField = match?.kind === "exact";
+      const hasPatternField  = match?.kind === "regex";
+
+`resolved=${line} matchKind=${match?.kind} hasOriginal=${hasOriginalField} pattern=${hasPatternField} `
+
+      console.log(
+        `[anchor] path=${ch.path} rawLine=${ch.anchor?.line ?? null} ` +
+        `resolved=${line} matchKind=${match?.kind} hasOriginal=${hasOriginalField} pattern=${hasPatternField} `+
+        `fuzzyFound=${fuzzyFound ?? "null"} nudged=${nudged ?? "null"} regexFound=${regexFound ?? "null"} ` +
+        `hunkStart=${hunkStart ?? "null"} fullLines=${full.split("\\n").length}`
+      );
+    }
+
+        // final guard — treat 1 as unknown everywhere !not required!
+    if (!line || line <= 1) {
+      const hunkStart = firstChangedHunkStart(meta.patch);
+      if (hunkStart) line = hunkStart;
+    }
 
     // Final snap: if proposed is single-line, and an identical current line exists within ±2 lines, snap to it.
     if (line && ch.hunk?.after && !ch.hunk.after.includes("\n")) {
@@ -688,8 +744,12 @@ export async function solveFailure(
     // Derive/normalize intent & explain for diagnostics (esp. noop)
     let intent = ch.intent ?? null;
     let explain = ch.explain ?? null;
-    const hasOriginal = !!ch.match?.original?.trim();
-    const originalNorm = hasOriginal ? normalizeBlock(ch.match!.original!) : "";
+      const hasOriginal =
+        ch.match?.kind === "exact" && ch.match.original.trim().length > 0;
+
+      const originalNorm =
+        ch.match?.kind === "exact" ? normalizeBlock(ch.match.original) : "";
+
     const differsFromOriginal = hasOriginal && originalNorm !== normalizeBlock(proposed);
 
     // If model didn’t provide intent, infer a sensible one:
@@ -819,10 +879,10 @@ export async function solveFailure(
       confidence,
       references: sol.summary.references,
     },
-    changes: validatedChanges,   // use validated+typed changes
+    changes: validatedChanges,   
     tool_invocations: [
       ...sol.tool_invocations,
-      ...toolInvocations,        // already in {name,args_json,ms,ok} shape after Patch 2
+      ...toolInvocations,        
     ],
     policy,
     reviewComments,
