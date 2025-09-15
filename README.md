@@ -18,7 +18,7 @@ ResolvCI mirrors the classic control-systems pattern:
 In our case, “the world” is GitHub.
 
 * **GitHub App (Ingestion Agent)**
-  It's is a kind of ambient agent. It waits for check run events and triggers our langgraph workflow when a check run failure occurs. 
+  Event-driven and ambient: subscribes to GitHub check_run webhooks; on failure (completed with conclusion: failure), it launches our LangGraph workflow. 
   Verifies HMAC, dedupes deliveries, pulls workflow logs, computes stable **error signatures** and a normalized tail, and upserts a row in TiDB.
 
 * **Analysis Agent (grounded retrieval)**
